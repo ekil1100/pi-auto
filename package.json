@@ -1,0 +1,38 @@
+{
+  "name": "pi-auto",
+  "version": "0.1.0",
+  "description": "Automatically select a scoped Pi model and thinking effort for each task",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "model-router"
+  ],
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.4",
+    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
