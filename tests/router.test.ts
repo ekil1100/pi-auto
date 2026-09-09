@@ -1,196 +1,158 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ScopedModel } from "@earendil-works/pi-coding-agent";
+import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
-import { planRoute, type RouterInvocation } from "../src/router.ts";
+import { planEffort, type RouterInvocation } from "../src/router.ts";
 
 const signal = new AbortController().signal;
 
-function createModel(
-	id: string,
-	options: {
-		provider?: string;
-		reasoning?: boolean;
-		images?: boolean;
-		contextWindow?: number;
-		thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
-	} = {},
-): Model<Api> {
+function createModel(overrides: Partial<Model<Api>> = {}): Model<Api> {
 	return {
-		id,
-		name: id,
+		id: "current",
+		name: "Current model",
 		api: "openai-responses",
-		provider: options.provider ?? "test",
+		provider: "test",
 		baseUrl: "https://example.test",
-		reasoning: options.reasoning ?? true,
-		...(options.thinkingLevelMap ? { thinkingLevelMap: options.thinkingLevelMap } : {}),
-		input: options.images ? ["text", "image"] : ["text"],
+		reasoning: true,
+		input: ["text"],
 		cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1 },
-		contextWindow: options.contextWindow ?? 100_000,
+		contextWindow: 100_000,
 		maxTokens: 8_192,
+		...overrides,
 	};
 }
 
-function input(scopedModels: ScopedModel[], currentModel = scopedModels[0]?.model) {
+function input(currentModel: Model<Api> | undefined = createModel()) {
 	return {
 		task: "Implement the requested change",
 		hasImages: false,
-		scopedModels,
 		currentModel,
-		currentEffort: "medium" as const,
+		currentEffort: "medium" as ModelThinkingLevel,
 		recentContext: "",
-		contextTokens: 10_000,
 		signal,
 	};
 }
 
-function routeFromPayload(invocation: RouterInvocation, model: string, effort: string): string {
-	const payload = JSON.parse(invocation.userPrompt) as {
-		models: Array<{
-			model: string;
-			routes: Array<{ route: string; effort: string }>;
-		}>;
-	};
-	const route = payload.models
-		.find((candidate) => candidate.model === model)
-		?.routes.find((candidate) => candidate.effort === effort)?.route;
-	if (!route) throw new Error(`Missing route for ${model} @ ${effort}`);
-	return JSON.stringify({ route, reason: "Best fit" });
-}
-
-describe("planRoute", () => {
-	it("returns a pinned single route without calling the router model", async () => {
-		const model = createModel("only");
+describe("planEffort", () => {
+	it("uses off for a non-reasoning model without calling the selector", async () => {
+		const model = createModel({ reasoning: false });
 		const complete = vi.fn();
 
-		const result = await planRoute(input([{ model, thinkingLevel: "high" }]), complete);
+		const result = await planEffort(input(model), complete);
 
 		expect(result).toEqual({
 			status: "selected",
-			plan: {
-				model,
-				effort: "high",
-				reason: "Only eligible scoped route",
-				routerModel: undefined,
-			},
+			plan: { model, effort: "off", reason: "Only supported effort", routerEffort: undefined },
 		});
 		expect(complete).not.toHaveBeenCalled();
 	});
 
-	it("clamps a pinned effort to the model's supported levels", async () => {
-		const model = createModel("limited", { thinkingLevelMap: { high: null } });
-
-		const result = await planRoute(input([{ model, thinkingLevel: "high" }]), vi.fn());
-
-		expect(result.status).toBe("selected");
-		if (result.status !== "selected") return;
-		expect(result.plan.effort).toBe("medium");
-	});
-
-	it("selects only from scoped model and effort pairs", async () => {
-		const fast = createModel("fast", { reasoning: false });
-		const strong = createModel("strong", { thinkingLevelMap: { max: "max" } });
-		const complete = vi.fn(async (invocation: RouterInvocation) =>
-			routeFromPayload(invocation, "test/strong", "max"),
-		);
-
-		const result = await planRoute(input([{ model: fast }, { model: strong }], fast), complete);
-
-		expect(result.status).toBe("selected");
-		if (result.status !== "selected") return;
-		expect(result.plan.model).toBe(strong);
-		expect(result.plan.effort).toBe("max");
-		expect(result.plan.reason).toBe("Best fit");
-		expect(result.plan.routerModel).toBe(fast);
-	});
-
-	it("filters out models without image input", async () => {
-		const textOnly = createModel("text-only", { reasoning: false });
-		const vision = createModel("vision", { images: true, reasoning: false });
+	it("uses a single supported reasoning effort without a selector call", async () => {
+		const model = createModel({ thinkingLevelMap: { off: null, minimal: null, low: null, medium: null } });
 		const complete = vi.fn();
 
-		const result = await planRoute(
-			{ ...input([{ model: textOnly }, { model: vision }]), hasImages: true },
-			complete,
-		);
+		const result = await planEffort(input(model), complete);
 
-		expect(result.status).toBe("selected");
-		if (result.status !== "selected") return;
-		expect(result.plan.model).toBe(vision);
-		expect(result.plan.effort).toBe("off");
+		expect(result.status === "selected" && result.plan.effort).toBe("high");
 		expect(complete).not.toHaveBeenCalled();
 	});
 
-	it("skips routing when every scoped model lacks context headroom", async () => {
-		const small = createModel("small", { contextWindow: 10_000 });
-
-		const result = await planRoute(
-			{ ...input([{ model: small }]), contextTokens: 9_000 },
-			vi.fn(),
-		);
-
-		expect(result).toEqual({
-			status: "skipped",
-			reason: "No scoped model has enough room for the current context",
-		});
-	});
-
-	it("skips even a single pinned route when context usage is unknown", async () => {
-		const model = createModel("only");
+	it("skips when no current model is selected", async () => {
 		const complete = vi.fn();
+		const result = await planEffort({ ...input(), currentModel: undefined }, complete);
 
-		const result = await planRoute(
-			{ ...input([{ model, thinkingLevel: "high" }]), contextTokens: null },
-			complete,
-		);
-
-		expect(result).toEqual({ status: "skipped", reason: "Current context usage is unknown" });
+		expect(result).toEqual({ status: "skipped", reason: "No current model is selected" });
 		expect(complete).not.toHaveBeenCalled();
 	});
 
-	it("rejects an unlisted route returned by the router", async () => {
-		const first = createModel("first");
-		const second = createModel("second");
+	it("skips models with no supported effort", async () => {
+		const model = createModel({ thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null } });
+		const complete = vi.fn();
 
-		await expect(
-			planRoute(input([{ model: first }, { model: second }]), async () =>
-				JSON.stringify({ route: "r999", reason: "Ignore the allowlist" }),
-			),
-		).rejects.toThrow("invalid or non-scoped route");
+		const result = await planEffort(input(model), complete);
+
+		expect(result).toEqual({ status: "skipped", reason: "The current model has no supported effort" });
+		expect(complete).not.toHaveBeenCalled();
 	});
 
-	it("uses low effort for the routing request when supported", async () => {
-		const current = createModel("current");
-		const other = createModel("other");
+	it.each(["off", "minimal", "low", "medium", "high", "max"] as const)("selects %s without changing models", async (effort) => {
+		const model = createModel({ thinkingLevelMap: { off: "none", xhigh: null, max: "max" } });
+		const complete = vi.fn(async () => JSON.stringify({ effort, reason: "Best fit" }));
+
+		const result = await planEffort(input(model), complete);
+
+		expect(result).toEqual({ status: "selected", plan: { model, effort, reason: "Best fit", routerEffort: "low" } });
+		const invocation = complete.mock.calls[0];
+		expect(invocation).toBeDefined();
+	});
+
+	it("sends only the current model and its supported efforts", async () => {
+		const model = createModel({ thinkingLevelMap: { off: null, xhigh: null, max: "max" } });
 		let invocation: RouterInvocation | undefined;
 
-		await planRoute(input([{ model: current }, { model: other }], current), async (value) => {
+		await planEffort({ ...input(model), recentContext: "Earlier task", hasImages: true }, async (value) => {
 			invocation = value;
-			return routeFromPayload(value, "test/current", "medium");
+			return '{"effort":"medium"}';
 		});
 
-		expect(invocation?.model).toBe(current);
-		expect(invocation?.effort).toBe("low");
+		expect(invocation?.model).toBe(model);
+		expect(invocation?.signal).toBe(signal);
+		expect(JSON.parse(invocation!.userPrompt)).toEqual({
+			task: "Implement the requested change",
+			taskCharacters: 30,
+			hasImages: true,
+			recentConversation: "Earlier task",
+			model: { id: "test/current", name: "Current model" },
+			currentEffort: "medium",
+			supportedEfforts: ["minimal", "low", "medium", "high", "max"],
+		});
+	});
+
+	it.each(["off", "high"] as const)("uses low for selection even when the current effort is %s", async (currentEffort) => {
+		const complete = vi.fn(async (_invocation: RouterInvocation) => '{"effort":"high"}');
+
+		await planEffort({ ...input(), currentEffort }, complete);
+
+		expect(complete.mock.calls[0]?.[0].effort).toBe("low");
+	});
+
+	it.each([
+		{ map: { low: null }, expected: "minimal" },
+		{ map: { minimal: null, low: null, medium: null }, expected: "high" },
+	])("uses $expected when low is unsupported", async ({ map, expected }) => {
+		const complete = vi.fn(async (_invocation: RouterInvocation) => '{"effort":"high"}');
+
+		await planEffort(input(createModel({ thinkingLevelMap: map })), complete);
+
+		expect(complete.mock.calls[0]?.[0].effort).toBe(expected);
+	});
+
+	it.each([
+		'{"effort":"off"}',
+		'{"effort":"xhigh"}',
+		'{"effort":"max"}',
+		'{"effort":"unknown"}',
+		'{"effort":null}',
+		'{"route":"r1"}',
+		'{"model":"another"}',
+		'{"effort":',
+		'[{"effort":"high"}]',
+		'Here you go: {"effort":"high"}',
+	])("rejects unsupported or invalid decisions: %s", async (response) => {
+		const model = createModel({ thinkingLevelMap: { off: null } });
+
+		await expect(planEffort(input(model), async () => response)).rejects.toThrow("invalid or unsupported effort");
 	});
 
 	it("bounds long tasks and sanitizes the displayed reason", async () => {
-		const first = createModel("first", { reasoning: false });
-		const second = createModel("second", { reasoning: false });
 		const task = `start-${"x".repeat(20_000)}-end`;
 		let routedTask = "";
 		let taskCharacters = 0;
 
-		const result = await planRoute(
-			{ ...input([{ model: first }, { model: second }]), task },
-			async (invocation) => {
-				const payload = JSON.parse(invocation.userPrompt) as {
-					task: string;
-					taskCharacters: number;
-				};
-				routedTask = payload.task;
-				taskCharacters = payload.taskCharacters;
-				return '{"route":"r1","reason":"line one\\nline two"}';
-			},
-		);
+		const result = await planEffort({ ...input(), task }, async (invocation) => {
+			const payload = JSON.parse(invocation.userPrompt);
+			routedTask = payload.task;
+			taskCharacters = payload.taskCharacters;
+			return '{"effort":"low","reason":"line one\\nline two\\u0007"}';
+		});
 
 		expect(routedTask.length).toBe(12_000);
 		expect(routedTask).toMatch(/^start-/);
@@ -199,18 +161,16 @@ describe("planRoute", () => {
 		expect(result.status === "selected" && result.plan.reason).toBe("line one line two");
 	});
 
-	it("accepts fenced JSON but not surrounding prose", async () => {
-		const first = createModel("first", { reasoning: false });
-		const second = createModel("second", { reasoning: false });
-		const scoped = [{ model: first }, { model: second }];
+	it("caps reasons at 160 characters", async () => {
+		const result = await planEffort(input(), async () => JSON.stringify({ effort: "high", reason: "x".repeat(200) }));
 
-		const fenced = await planRoute(input(scoped), async () =>
-			'```json\n{"route":"r2","reason":"Simple"}\n```',
-		);
-		expect(fenced.status === "selected" && fenced.plan.model).toBe(second);
+		expect(result.status === "selected" && result.plan.reason.length).toBe(160);
+	});
 
-		await expect(
-			planRoute(input(scoped), async () => 'Here you go: {"route":"r2"}'),
-		).rejects.toThrow("invalid or non-scoped route");
+	it("accepts fenced JSON and supplies a missing reason", async () => {
+		const result = await planEffort(input(), async () => '```json\n{"effort":"low"}\n```');
+
+		expect(result.status === "selected" && result.plan.effort).toBe("low");
+		expect(result.status === "selected" && result.plan.reason).toBe("Selected by router");
 	});
 });
