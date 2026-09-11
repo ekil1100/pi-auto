@@ -1,8 +1,8 @@
 import { stripVTControlCharacters } from "node:util";
 import { keyHint, type CustomEntry, type Theme } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
-import { DECISION_ENTRY_TYPE, formatAutoEffort, readDecision, renderDecisionEntry, type EffortDecision } from "../src/selection-ui.ts";
+import { DECISION_ENTRY_TYPE, createSelectingWidget, formatAutoEffort, readDecision, renderDecisionEntry, type EffortDecision } from "../src/selection-ui.ts";
 
 vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("@earendil-works/pi-coding-agent")>();
@@ -45,6 +45,26 @@ function render(expanded: boolean, overrides: Partial<EffortDecision> = {}, widt
 }
 
 describe("selection UI", () => {
+	it("spins in front of the selecting label and stops once disposed", () => {
+		vi.useFakeTimers();
+		try {
+			const requestRender = vi.fn();
+			const widget = createSelectingWidget({ requestRender } as unknown as TUI, createTheme() as unknown as Theme);
+
+			expect(widget.render(80)).toEqual([" ⠋ choosing effort"]);
+			vi.advanceTimersByTime(80);
+			expect(widget.render(80)).toEqual([" ⠙ choosing effort"]);
+			expect(requestRender).toHaveBeenCalledTimes(1);
+
+			widget.dispose();
+			vi.advanceTimersByTime(800);
+			expect(requestRender).toHaveBeenCalledTimes(1);
+			expect(widget.render(80)).toEqual([" ⠙ choosing effort"]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("uses primary auto and the corresponding effort color", () => {
 		const theme = createTheme();
 		expect(formatAutoEffort(theme as unknown as Theme, "high")).toBe("auto · high");

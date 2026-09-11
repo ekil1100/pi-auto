@@ -221,8 +221,7 @@ describe("pi-auto lifecycle", () => {
 
 		const pending = harness.start("Continue");
 		await vi.waitFor(() => expect(harness.complete).toHaveBeenCalled());
-		expect(harness.ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-auto-selecting", ["Choosing effort…"]);
-		expect(harness.ctx.ui.theme.fg).toHaveBeenCalledWith("accent", "Choosing effort…");
+		expect(harness.ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-auto-selecting", expect.any(Function));
 		expect(decisions(harness)).toEqual([]);
 
 		resolve(routerResponse(current));

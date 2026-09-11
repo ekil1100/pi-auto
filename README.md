@@ -62,7 +62,7 @@ pi install /absolute/path/to/pi-auto
 
 ## 选择记录
 
-- 任务开始时显示主题色的 `Choosing effort…` 临时进度行。
+- 任务开始时显示主题色 spinner 与 `choosing effort` 临时进度行，判断结束后移除。
 - 判断完成后移除进度行，在对话历史中保留一条彩色的 `auto · low` 记录，默认折叠；即使 effort 不变也会记录。
 - 按 Pi 原生 Ctrl+O 展开或折叠详情，与工具输出共用展开状态，快捷键提示遵循用户的键位配置。详情包含模型、前后 effort、判断模型与 effort、理由和耗时。
 - 失败时保留原 effort，记录标记为 `kept`；选择期间关闭自动选择会取消等待，记录标记为 `cancelled`，迟到结果不会生效。

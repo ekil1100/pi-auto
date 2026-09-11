@@ -9,7 +9,7 @@ import {
 import type { BeforeAgentStartEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { planEffort, type CompleteRouter, type RouterInvocation } from "./router.ts";
 import { collectRecentContext, hasContextImages } from "./session-context.ts";
-import { DECISION_ENTRY_TYPE, formatAutoEffort, readDecision, renderDecisionEntry, type EffortDecision } from "./selection-ui.ts";
+import { createSelectingWidget, DECISION_ENTRY_TYPE, formatAutoEffort, readDecision, renderDecisionEntry, type EffortDecision } from "./selection-ui.ts";
 
 const ROUTER_TIMEOUT_MS = 20_000;
 const ROUTER_MAX_OUTPUT_TOKENS = 2_048;
@@ -71,7 +71,7 @@ export default function piAuto(pi: ExtensionAPI): void {
 		let routerModel: string | undefined;
 		let routerEffort: EffortDecision["routerEffort"];
 		let outcome: Pick<EffortDecision, "status" | "reason"> = { status: "kept", reason: "Selection interrupted" };
-		ctx.ui.setWidget(PROGRESS_KEY, [ctx.ui.theme.fg("accent", "Choosing effort…")]);
+		ctx.ui.setWidget(PROGRESS_KEY, createSelectingWidget);
 		try {
 			const result = await planForEvent(event, ctx, signal, (invocation) => {
 				routerModel = modelKey(invocation.model);

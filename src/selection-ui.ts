@@ -1,8 +1,13 @@
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { keyHint, type EntryRenderer, type SessionEntry, type Theme } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
 
 export const DECISION_ENTRY_TYPE = "pi-auto-decision";
+
+const SELECTING_LABEL = "choosing effort";
+/** Same Braille frames and cadence as Pi's built-in loader. */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL_MS = 80;
 
 export interface EffortDecision {
 	status: "selected" | "kept" | "cancelled";
@@ -17,6 +22,21 @@ export interface EffortDecision {
 
 export function formatAutoEffort(theme: Theme, effort: ModelThinkingLevel): string {
 	return theme.fg("accent", "auto") + theme.fg("dim", " · ") + theme.getThinkingBorderColor(effort)(effort);
+}
+
+/** Spinning progress row shown while the effort request is pending; stops when the widget is cleared. */
+export function createSelectingWidget(tui: TUI, theme: Theme): Component & { dispose(): void } {
+	let frame = 0;
+	const timer = setInterval(() => {
+		frame = (frame + 1) % SPINNER_FRAMES.length;
+		tui.requestRender();
+	}, SPINNER_INTERVAL_MS);
+
+	return {
+		render: (_width) => [` ${theme.fg("accent", SPINNER_FRAMES[frame]!)} ${theme.fg("accent", SELECTING_LABEL)}`],
+		invalidate: () => {},
+		dispose: () => clearInterval(timer),
+	};
 }
 
 export const renderDecisionEntry: EntryRenderer<EffortDecision> = (entry, { expanded }, theme) => {
