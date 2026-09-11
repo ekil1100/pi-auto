@@ -89,3 +89,5 @@ npm run check
 ```
 
 核心 effort 判断位于 `src/router.ts`，Pi 生命周期适配位于 `src/index.ts`，选择记录与状态渲染位于 `src/selection-ui.ts`，近期会话裁剪位于 `src/session-context.ts`。
+
+软件开发评测使用 [Aider polyglot 本地 pilot](benchmarks/aider-polyglot.md)：40 道 Exercism 题比较固定 `max` 与 `auto`，所有 provider 流量经计量代理，selector 与主调用都计入。`npm run benchmark -- plan` 只打印任务矩阵，`oracle` 验证参考解且不调用模型，`compare` 需显式 `--allow-paid`。

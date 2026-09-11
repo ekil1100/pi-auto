@@ -1,0 +1,27 @@
+{
+  "model_id": "deepseek-flash",
+  "pricing_checked_at": "2026-09-10",
+  "pricing_source": "https://api-docs.deepseek.com/quick_start/pricing/",
+  "peak_usd_per_million": { "input": 0.30, "cache": 0.006, "output": 1.20 },
+  "request_reserve_usd": 0.05,
+  "max_budget_usd": 10,
+  "model": {
+    "id": "deepseek-flash",
+    "name": "DeepSeek V4.1 Flash (benchmark)",
+    "reasoning": true,
+    "input": ["text"],
+    "contextWindow": 1000000,
+    "maxTokens": 384000,
+    "thinkingLevelMap": { "minimal": null, "low": "low", "medium": null, "high": "high", "xhigh": null, "max": "max" },
+    "cost": { "input": 0.30, "output": 1.20, "cacheRead": 0.006, "cacheWrite": 0 },
+    "compat": {
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "supportsReasoningEffort": true,
+      "supportsUsageInStreaming": true,
+      "maxTokensField": "max_tokens",
+      "requiresReasoningContentOnAssistantMessages": true,
+      "thinkingFormat": "deepseek"
+    }
+  }
+}

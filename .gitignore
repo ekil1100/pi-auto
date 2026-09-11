@@ -1,4 +1,8 @@
 node_modules/
 coverage/
+benchmarks/results/
+benchmarks/.venv/
+benchmarks/.cache/
+__pycache__/
 *.log
 .DS_Store

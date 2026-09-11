@@ -19,7 +19,9 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "benchmark": "uv run --project benchmarks --locked python -m benchmarks.aider",
+    "benchmark:test": "uv run --project benchmarks --locked python -m unittest discover -s benchmarks/tests -v"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
