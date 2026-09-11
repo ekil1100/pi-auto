@@ -2,6 +2,15 @@
   "name": "pi-auto",
   "version": "0.1.0",
   "description": "Automatically select thinking effort for each task without changing the current Pi model",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ekil1100/pi-auto.git"
+  },
+  "homepage": "https://github.com/ekil1100/pi-auto#readme",
+  "bugs": {
+    "url": "https://github.com/ekil1100/pi-auto/issues"
+  },
   "type": "module",
   "keywords": [
     "pi-package",
