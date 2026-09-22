@@ -1,9 +1,10 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, AssistantMessage, Context, ImageContent, Model, ModelThinkingLevel, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import {
 	SessionManager,
+	SettingsManager,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
@@ -24,6 +25,7 @@ vi.mock("../src/jev.ts", async (importOriginal) => {
 const jevDecision: JevDecision = { effort: "high", model: JEV_MODEL, confidence: 0.85, probabilities: { off: 0, minimal: 0, low: 0, medium: 0.15, high: 0.85 } };
 
 beforeEach(() => {
+	vi.spyOn(SettingsManager, "create").mockReturnValue(SettingsManager.inMemory({ defaultThinkingLevel: "medium" }));
 	vi.stubEnv("TYPESAFE_API_KEY", undefined);
 	vi.mocked(selectWithJev).mockReset().mockResolvedValue(jevDecision);
 	vi.mocked(classifyWithJev).mockReset().mockImplementation(async (_key, { candidates }) => candidates.map(({ id }) => ({ id, importance: "useful" })));
@@ -31,6 +33,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	vi.unstubAllEnvs();
+	vi.restoreAllMocks();
 });
 
 function createModel(id = "current", overrides: Partial<Model<Api>> = {}): Model<Api> {
@@ -96,6 +99,9 @@ function createHarness(
 		setThinkingLevel: vi.fn((effort: ModelThinkingLevel) => { activeEffort = effort; }),
 	};
 	const ctx = {
+		cwd: process.cwd(),
+		isProjectTrusted: vi.fn(() => false),
+		signal: undefined as AbortSignal | undefined,
 		mode: "rpc" as ExtensionContext["mode"],
 		get model() { return activeModel; },
 		get thinkingLevel() { return activeEffort; },
@@ -213,6 +219,22 @@ describe("Jev lifecycle", () => {
 		expect(harness.ctx.sessionManager.buildSessionContext().messages).toHaveLength(1);
 	});
 
+	it("closes only its own Jev transport on session shutdown", async () => {
+		vi.stubEnv("TYPESAFE_API_KEY", "test-typesafe-key");
+		const first = createHarness(createModel());
+		const second = createHarness(createModel());
+		await first.start("First task");
+		await second.start("Second task");
+		const firstFetch = vi.mocked(selectWithJev).mock.calls[0]![2];
+		const secondFetch = vi.mocked(selectWithJev).mock.calls[1]![2];
+		expect(firstFetch).not.toBe(secondFetch);
+		await first.emit({ type: "session_shutdown", reason: "reload" });
+		await expect(firstFetch("https://unused.invalid/", undefined, () => {})).rejects.toThrow("Jev transport is closed");
+		// The second instance stays open; an already-aborted signal prevents any network I/O.
+		await expect(secondFetch("https://unused.invalid/", { signal: AbortSignal.abort() }, () => {})).rejects.toMatchObject({ name: "AbortError" });
+		await second.emit({ type: "session_shutdown", reason: "quit" });
+	});
+
 	it("persists timing snapshots and exposes them through status", async () => {
 		vi.stubEnv("TYPESAFE_API_KEY", "test-typesafe-key");
 		const timing: JevTiming = { setupMs: 1, headersMs: 500, bodyAndDecodeMs: 2, validateMs: 0.1, totalMs: 503.1, requestBytes: 2000,
@@ -259,25 +281,26 @@ describe("Jev lifecycle", () => {
 		expect(decisions(harness).map((decision) => decision.routerConfidence)).toEqual([undefined, 0.85, undefined]);
 	});
 
-	it.each(["Jev request failed (HTTP 401)", "Jev request failed (HTTP 429)", "Jev returned an invalid decision"])("keeps effort without fallback on %s", async (message) => {
+	it.each(["Jev request failed", "Jev request failed (HTTP 401)", "Jev request failed (HTTP 429)", "Jev returned an invalid decision"])("falls back to the current model once on %s", async (message) => {
 		vi.stubEnv("TYPESAFE_API_KEY", "test-typesafe-key");
 		vi.mocked(selectWithJev).mockRejectedValueOnce(new Error(message));
 		const harness = createHarness(createModel());
 
 		await harness.start("Continue");
 
-		expect(harness.ctx.thinkingLevel).toBe("medium");
-		expect(harness.complete).not.toHaveBeenCalled();
-		expect(harness.getApiKeyAndHeaders).not.toHaveBeenCalled();
-		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
-		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: message, routerModel: `typesafe/${JEV_MODEL}` });
+		expect(harness.ctx.thinkingLevel).toBe("high");
+		expect(harness.complete).toHaveBeenCalledTimes(1);
+		expect(selectWithJev).toHaveBeenCalledTimes(1);
+		expect(harness.complete.mock.calls[0]?.[2]).toMatchObject({ maxRetries: 0 });
+		expect(harness.pi.setModel).not.toHaveBeenCalled();
+		expect(decisions(harness)[0]).toMatchObject({ status: "selected", reason: `Jev failed (${message}); current-model fallback: Best fit`, routerModel: "test/current" });
 		expect(harness.ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-auto-selecting", undefined);
 	});
 
-	it("times out without fallback and never applies a late Jev result", async () => {
+	it("uses a fresh fallback deadline after a Jev timeout and ignores a late result", async () => {
 		vi.stubEnv("TYPESAFE_API_KEY", "test-typesafe-key");
 		const controller = new AbortController();
-		const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+		const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValueOnce(controller.signal);
 		try {
 			let resolve!: (decision: JevDecision) => void;
 			vi.mocked(selectWithJev).mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
@@ -290,9 +313,11 @@ describe("Jev lifecycle", () => {
 			await Promise.resolve();
 
 			expect(vi.mocked(selectWithJev).mock.calls[0]?.[1].signal.aborted).toBe(true);
-			expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
-			expect(harness.complete).not.toHaveBeenCalled();
-			expect(decisions(harness)).toEqual([expect.objectContaining({ status: "kept", reason: "router timed out" })]);
+			expect(harness.pi.setThinkingLevel).toHaveBeenCalledExactlyOnceWith("high");
+			expect(harness.complete).toHaveBeenCalledTimes(1);
+			expect(timeout).toHaveBeenCalledTimes(2);
+			expect(harness.complete.mock.calls[0]?.[2]?.signal).not.toBe(vi.mocked(selectWithJev).mock.calls[0]?.[1].signal);
+			expect(decisions(harness)).toEqual([expect.objectContaining({ status: "selected", reason: "Jev failed (router timed out); current-model fallback: Best fit" })]);
 			expect(decisions(harness)[0]?.routerConfidence).toBeUndefined();
 		} finally {
 			timeout.mockRestore();
@@ -346,6 +371,173 @@ describe("Jev lifecycle", () => {
 		expect(harness.complete).not.toHaveBeenCalled();
 		if (change === "shutdown") expect(harness.pi.appendEntry).not.toHaveBeenCalled();
 		else expect(decisions(harness)[0]?.status).toBe(change.startsWith("off") ? "cancelled" : "kept");
+	});
+});
+
+describe("configured default fallback", () => {
+	it.each(["off", "low", "high", "max"] as const)("restores configured %s after both selectors fail, without changing models", async (effort) => {
+		vi.stubEnv("TYPESAFE_API_KEY", "test-key");
+		vi.mocked(SettingsManager.create).mockReturnValue(SettingsManager.inMemory({ defaultThinkingLevel: effort }));
+		vi.mocked(selectWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+		const model = createModel("current", { thinkingLevelMap: { max: "max" } });
+		const harness = createHarness(model);
+		harness.complete.mockRejectedValueOnce(new Error("private-error-body"));
+		await harness.start("Continue");
+		expect(harness.ctx.thinkingLevel).toBe(effort);
+		expect(selectWithJev).toHaveBeenCalledTimes(1);
+		expect(harness.complete).toHaveBeenCalledTimes(1);
+		expect(harness.pi.setThinkingLevel).toHaveBeenCalledExactlyOnceWith(effort);
+		expect(harness.pi.setModel).not.toHaveBeenCalled();
+		expect(decisions(harness)[0]).toMatchObject({ reason: `Jev failed (Jev request failed); current-model fallback failed: router request failed; restored Pi default effort (${effort})` });
+		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).not.toContain("private-error-body");
+	});
+
+	it("prefers the per-model default and clamps it to supported levels", async () => {
+		vi.mocked(SettingsManager.create).mockReturnValue(SettingsManager.inMemory({ defaultThinkingLevel: "low", modelThinkingLevels: { "test/current": "max" } }));
+		const harness = createHarness(createModel());
+		harness.complete.mockRejectedValueOnce(new Error("failure"));
+		await harness.start("Continue");
+		expect(harness.ctx.thinkingLevel).toBe("high");
+		expect(SettingsManager.create).toHaveBeenCalledWith(harness.ctx.cwd, undefined, { projectTrusted: false });
+	});
+
+	it("uses Pi's built-in medium only when no default is configured", async () => {
+		vi.mocked(SettingsManager.create).mockReturnValue(SettingsManager.inMemory());
+		const harness = createHarness(createModel());
+		harness.pi.setThinkingLevel("high");
+		harness.complete.mockRejectedValueOnce(new Error("failure"));
+		await harness.start("Continue");
+		expect(harness.ctx.thinkingLevel).toBe("medium");
+	});
+
+	it.each([true, false])("reads saved settings without modifying them, with project trust %s", async (trusted) => {
+		vi.mocked(SettingsManager.create).mockRestore();
+		await mkdir(".agents", { recursive: true });
+		const root = await mkdtemp(join(process.cwd(), ".agents", "fallback-settings-"));
+		try {
+			const agentDir = join(root, "agent");
+			const cwd = join(root, "project");
+			await mkdir(agentDir);
+			await mkdir(join(cwd, ".pi"), { recursive: true });
+			const globalPath = join(agentDir, "settings.json"), projectPath = join(cwd, ".pi", "settings.json");
+			const globalText = JSON.stringify({ defaultThinkingLevel: "low" });
+			const projectText = JSON.stringify({ defaultThinkingLevel: "high" });
+			await writeFile(globalPath, globalText);
+			await writeFile(projectPath, projectText);
+			vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+			const harness = createHarness(createModel());
+			harness.ctx.cwd = cwd;
+			harness.ctx.isProjectTrusted.mockReturnValue(trusted);
+			harness.complete.mockRejectedValueOnce(new Error("failure"));
+			await harness.start("Continue");
+			expect(harness.ctx.thinkingLevel).toBe(trusted ? "high" : "low");
+			expect(await readFile(globalPath, "utf8")).toBe(globalText);
+			expect(await readFile(projectPath, "utf8")).toBe(projectText);
+		} finally { await rm(root, { recursive: true, force: true }); }
+	});
+
+	it("keeps the current effort if the saved defaults cannot be read", async () => {
+		vi.mocked(SettingsManager.create).mockImplementationOnce(() => { throw new Error("private-settings-error"); });
+		const harness = createHarness(createModel());
+		harness.complete.mockRejectedValueOnce(new Error("failure"));
+		await harness.start("Continue");
+		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
+		expect(decisions(harness)[0]?.reason).toContain("Pi default effort unavailable");
+		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).not.toContain("private-settings-error");
+	});
+
+	it.each([
+		'{"defaultThinkingLevel":null}',
+		'{"defaultThinkingLevel":"invalid"}',
+		'{"defaultThinkingLevel":42}',
+		'{"defaultThinkingLevel":"low","modelThinkingLevels":{"test/current":null}}',
+	])("does not apply an explicitly invalid default: %s", async (json) => {
+		vi.mocked(SettingsManager.create).mockReturnValue(SettingsManager.inMemory(JSON.parse(json)));
+		const harness = createHarness(createModel());
+		harness.pi.setThinkingLevel("high");
+		harness.pi.setThinkingLevel.mockClear();
+		harness.complete.mockRejectedValueOnce(new Error("failure"));
+		await harness.start("Continue");
+		expect(harness.ctx.thinkingLevel).toBe("high");
+		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
+		expect(decisions(harness)[0]?.reason).toContain("Pi default effort unavailable");
+	});
+
+	it.each(["jev", "fallback"] as const)("honors the runtime cancellation signal during %s", async (phase) => {
+		vi.stubEnv("TYPESAFE_API_KEY", "test-key");
+		const harness = createHarness(createModel());
+		const user = new AbortController();
+		harness.ctx.signal = user.signal;
+		const remove = vi.spyOn(user.signal, "removeEventListener");
+		let fail!: (error: Error) => void;
+		if (phase === "jev") vi.mocked(selectWithJev).mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+		else {
+			vi.mocked(selectWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+			harness.complete.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+		}
+		const pending = harness.start("Continue");
+		await vi.waitFor(() => expect(phase === "jev" ? selectWithJev : harness.complete).toHaveBeenCalled());
+		user.abort("private-cancellation-reason");
+		await pending;
+		fail(new Error("late failure"));
+		await Promise.resolve();
+		expect(decisions(harness)[0]).toMatchObject({ status: "cancelled", reason: "Selection cancelled by user" });
+		expect(SettingsManager.create).not.toHaveBeenCalled();
+		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
+		expect(harness.complete).toHaveBeenCalledTimes(phase === "jev" ? 0 : 1);
+		expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+	});
+
+	it("does not inherit the previous automatic effort as the configured default", async () => {
+		vi.mocked(SettingsManager.create).mockReturnValue(SettingsManager.inMemory({ defaultThinkingLevel: "low" }));
+		const harness = createHarness(createModel());
+		await harness.start("First task");
+		expect(harness.ctx.thinkingLevel).toBe("high");
+		harness.complete.mockRejectedValueOnce(new Error("failure"));
+		await harness.start("Second task");
+		expect(harness.ctx.thinkingLevel).toBe("low");
+	});
+
+	it.each(["off", "model", "effort", "shutdown"] as const)("does not restore defaults after %s during fallback", async (change) => {
+		vi.stubEnv("TYPESAFE_API_KEY", "test-key");
+		vi.mocked(selectWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+		const harness = createHarness(createModel());
+		let reject!: (error: Error) => void;
+		harness.complete.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+		const pending = harness.start("Continue");
+		await vi.waitFor(() => expect(harness.complete).toHaveBeenCalled());
+		if (change === "off") await harness.command("off");
+		if (change === "model") await harness.pi.setModel(createModel("new"));
+		if (change === "effort") harness.pi.setThinkingLevel("low");
+		if (change === "shutdown") await harness.emit({ type: "session_shutdown", reason: "reload" });
+		reject(new Error("failure"));
+		await pending;
+		expect(SettingsManager.create).not.toHaveBeenCalled();
+		expect(harness.pi.setThinkingLevel).toHaveBeenCalledTimes(change === "effort" ? 1 : 0);
+		if (change === "shutdown") expect(harness.pi.appendEntry).not.toHaveBeenCalled();
+	});
+
+	it("ignores late Jev diagnostics while the current-model fallback is still running", async () => {
+		vi.stubEnv("TYPESAFE_API_KEY", "test-key");
+		const deadline = new AbortController();
+		vi.spyOn(AbortSignal, "timeout").mockReturnValueOnce(deadline.signal);
+		let resolveJev!: (value: JevDecision) => void;
+		vi.mocked(selectWithJev).mockImplementationOnce(() => new Promise((resolve) => { resolveJev = resolve; }));
+		const harness = createHarness(createModel());
+		let resolveModel!: (value: AssistantMessage) => void;
+		harness.complete.mockImplementationOnce(() => new Promise((resolve) => { resolveModel = resolve; }));
+		const pending = harness.start("Continue");
+		await vi.waitFor(() => expect(selectWithJev).toHaveBeenCalled());
+		deadline.abort();
+		await vi.waitFor(() => expect(harness.complete).toHaveBeenCalled());
+		vi.mocked(selectWithJev).mock.calls[0]![1].onTiming?.({ totalMs: 99999 });
+		resolveJev(jevDecision);
+		await Promise.resolve();
+		resolveModel(routerResponse(harness.ctx.model!));
+		await pending;
+		expect(decisions(harness)[0]).toMatchObject({ routerModel: "test/current", routerEffort: "low" });
+		expect(decisions(harness)[0]?.routerConfidence).toBeUndefined();
+		expect(decisions(harness)[0]?.jevTiming).toBeUndefined();
 	});
 });
 
@@ -672,7 +864,7 @@ describe("pi-auto lifecycle", () => {
 
 		expect(harness.ctx.thinkingLevel).toBe("medium");
 		expect(harness.complete).not.toHaveBeenCalled();
-		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: "router authentication failed" });
+		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: "router authentication failed; restored Pi default effort (medium)" });
 	});
 
 	it.each(["auth-result", "auth-rejection", "provider-sync", "provider-rejection"])("never persists echoed credentials from %s", async (failure) => {
@@ -683,7 +875,7 @@ describe("pi-auto lifecycle", () => {
 		if (failure === "provider-sync") harness.provider.streamSimple.mockImplementationOnce(() => { throw new Error(privateBody); });
 		if (failure === "provider-rejection") harness.complete.mockRejectedValueOnce(new Error(privateBody));
 		await harness.start("Continue");
-		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: failure.startsWith("auth") ? "router authentication failed" : "router request failed" });
+		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: `${failure.startsWith("auth") ? "router authentication failed" : "router request failed"}; restored Pi default effort (medium)` });
 		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).not.toContain("secret-canary");
 		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).not.toContain("private-body");
 	});
@@ -708,7 +900,7 @@ describe("pi-auto lifecycle", () => {
 			expect(harness.complete.mock.calls[0]?.[2]?.signal?.aborted).toBe(true);
 			expect(harness.ctx.thinkingLevel).toBe("medium");
 			expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
-			expect(decisions(harness)).toEqual([expect.objectContaining({ status: "kept", reason: "router timed out" })]);
+			expect(decisions(harness)).toEqual([expect.objectContaining({ status: "kept", reason: "router timed out; restored Pi default effort (medium)" })]);
 			expect(harness.ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-auto-selecting", undefined);
 		} finally {
 			timeout.mockRestore();
@@ -987,10 +1179,15 @@ describe("two-stage lifecycle", () => {
 		await vi.advanceTimersByTimeAsync(4_999);
 		expect(harness.pi.appendEntry).not.toHaveBeenCalled();
 		await vi.advanceTimersByTimeAsync(1);
+		if (backend === "jev") {
+			expect(AbortSignal.timeout).toHaveBeenCalledTimes(2);
+			expect(harness.pi.appendEntry).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(10_000);
+		}
 		await pending;
 		expect(selectionSignal?.aborted).toBe(true);
-		expect(decisions(harness)).toEqual([expect.objectContaining({ status: "kept", reason: "router timed out", elapsedMs: 10_000,
-			routing: expect.objectContaining({ compaction: expect.objectContaining({ status: "extracted", elapsedMs: 5_000 }) }) })]);
+		expect(decisions(harness)).toEqual([expect.objectContaining({ status: "kept", reason: expect.stringContaining("router timed out"), elapsedMs: backend === "jev" ? 20_000 : 10_000,
+			routing: expect.objectContaining({ compaction: expect.objectContaining({ status: "extracted", elapsedMs: backend === "jev" ? 0 : 5_000 }) }) })]);
 		if (backend === "jev") expect(decisions(harness)[0]?.jevTiming).toEqual({ setupMs: 2 });
 		const saved = JSON.stringify(harness.pi.appendEntry.mock.calls);
 		harness.release();
@@ -998,23 +1195,23 @@ describe("two-stage lifecycle", () => {
 		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).toBe(saved);
 		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
 		expect(harness.ctx.thinkingLevel).toBe("medium");
-		if (backend === "jev") expect(harness.complete).not.toHaveBeenCalled();
+		if (backend === "jev") expect(harness.complete).toHaveBeenCalledTimes(2);
 		else expect(selectWithJev).not.toHaveBeenCalled();
 	});
 
 	it.each(["model", "jev"] as const)("never launches selection after a %s classifier ignores the deadline", async (backend) => {
 		const harness = twoStageHarness(backend, "context");
 		const pending = harness.start("Continue");
-		await vi.advanceTimersByTimeAsync(10_000);
+		await vi.advanceTimersByTimeAsync(backend === "jev" ? 20_000 : 10_000);
 		await pending;
-		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: "router timed out", routing: { compaction: { status: "extracting" } } });
+		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: expect.stringContaining("router timed out"), routing: { compaction: { status: "extracting" } } });
 		expect(decisions(harness)[0]?.routing?.compaction).not.toHaveProperty("elapsedMs");
 		const saved = JSON.stringify(harness.pi.appendEntry.mock.calls);
 		harness.release();
 		await vi.advanceTimersByTimeAsync(10_000);
-		expect(harness.phases).toEqual(["context"]);
+		expect(harness.phases).toEqual(backend === "jev" ? ["context", "context"] : ["context"]);
 		expect(selectWithJev).not.toHaveBeenCalled();
-		expect(harness.complete).toHaveBeenCalledTimes(backend === "model" ? 1 : 0);
+		expect(harness.complete).toHaveBeenCalledTimes(1);
 		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).toBe(saved);
 		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
 	});
@@ -1065,6 +1262,50 @@ describe("two-stage lifecycle", () => {
 			});
 		}
 	}
+
+	it.each(["context", "effort"] as const)("restarts with the current model after Jev %s failure", async (phase) => {
+		const harness = twoStageHarness("jev");
+		if (phase === "context") vi.mocked(classifyWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+		else vi.mocked(selectWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+		await harness.start("Continue");
+		expect(classifyWithJev).toHaveBeenCalledTimes(1);
+		expect(selectWithJev).toHaveBeenCalledTimes(phase === "effort" ? 1 : 0);
+		expect(harness.complete).toHaveBeenCalledTimes(2);
+		expect(harness.ctx.thinkingLevel).toBe("high");
+		expect(decisions(harness)[0]).toMatchObject({ routerModel: "test/current", reason: expect.stringContaining("current-model fallback:") });
+		expect(decisions(harness)[0]?.contextDecisions).toBeUndefined();
+		expect(decisions(harness)[0]?.routerConfidence).toBeUndefined();
+	});
+
+	it("keeps effort when fallback classification succeeds but required context exceeds the budget", async () => {
+		vi.mocked(SettingsManager.create).mockReturnValue(SettingsManager.inMemory({ defaultThinkingLevel: "low" }));
+		const harness = twoStageHarness("jev");
+		vi.mocked(classifyWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+		harness.complete.mockImplementationOnce(async (model, context) => {
+			const content = context.messages[0]!.content;
+			if (!Array.isArray(content) || content[0]?.type !== "text") throw new Error("Missing request");
+			const { candidates } = JSON.parse(content[0].text) as { candidates: { id: string }[] };
+			return routerResponse(model, { content: [{ type: "text", text: JSON.stringify(candidates.map(({ id }) => ({ id, importance: "required" }))) }] });
+		});
+		await harness.start("Continue");
+		expect(harness.complete).toHaveBeenCalledTimes(1);
+		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
+		expect(SettingsManager.create).not.toHaveBeenCalled();
+		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: expect.stringContaining("fallback skipped: required_context_exceeds_budget") });
+	});
+
+	it("restores the configured effort immediately when the fallback classifier also fails", async () => {
+		vi.mocked(SettingsManager.create).mockReturnValue(SettingsManager.inMemory({ defaultThinkingLevel: "low" }));
+		const harness = twoStageHarness("jev");
+		vi.mocked(classifyWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+		harness.complete.mockRejectedValueOnce(new Error("fallback classifier failed"));
+		await harness.start("Continue");
+		expect(classifyWithJev).toHaveBeenCalledTimes(1);
+		expect(selectWithJev).not.toHaveBeenCalled();
+		expect(harness.complete).toHaveBeenCalledTimes(1);
+		expect(harness.ctx.thinkingLevel).toBe("low");
+		expect(decisions(harness)[0]?.reason).toContain("restored Pi default effort (low)");
+	});
 
 	it.each(["model", "jev"] as const)("keeps effort when %s required context overflows without selecting or falling back", async (backend) => {
 		const harness = twoStageHarness(backend);
@@ -1154,7 +1395,7 @@ describe("two-stage lifecycle", () => {
 		const harness = twoStageHarness("model");
 		harness.complete.mockResolvedValueOnce(routerResponse(harness.ctx.model!, { content: [{ type: "text", text: 'private-response-body private-current-task' }] }));
 		await harness.start("private-current-task");
-		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: "context_classification_failed" });
+		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: "context_classification_failed; restored Pi default effort (medium)" });
 		expect(harness.complete).toHaveBeenCalledTimes(1);
 		expect(selectWithJev).not.toHaveBeenCalled();
 		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();

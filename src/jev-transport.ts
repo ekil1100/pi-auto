@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { channel } from "node:diagnostics_channel";
+import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
 
 export interface JevTransportTiming {
 	status: "observed" | "partial" | "unavailable" | "ambiguous";
@@ -11,6 +12,29 @@ export interface JevTransportTiming {
 	bodySentMs?: number;
 	responseHeadersMs?: number;
 	afterUploadMs?: number;
+}
+
+export type TimedJevFetch = (url: string, init: RequestInit | undefined, onTiming: (timing: JevTransportTiming) => void) => Promise<Response>;
+
+/** One lazy connection pool per extension instance; never changes the global dispatcher. */
+export function createJevTransport(): { fetch: TimedJevFetch; dispose(): Promise<void> } {
+	let dispatcher: EnvHttpProxyAgent | undefined;
+	let disposed = false;
+	return {
+		async fetch(url, init, onTiming) {
+			if (disposed) throw new Error("Jev transport is closed");
+			init?.signal?.throwIfAborted();
+			dispatcher ??= new EnvHttpProxyAgent();
+			const options = { ...init, dispatcher };
+			// The SDK sends string URLs and JSON bodies. Undici and DOM fetch types differ,
+			// but both expose the Response methods the SDK consumes; no response data is copied.
+			return fetchWithTransportTiming(url, options, onTiming, undiciFetch as unknown as typeof globalThis.fetch);
+		},
+		async dispose() {
+			disposed = true;
+			await dispatcher?.destroy();
+		},
+	};
 }
 
 type SocketInfo = { id?: number; used: boolean; connectedEpoch: number; connectMs?: number };
@@ -193,6 +217,7 @@ export async function fetchWithTransportTiming(
 	url: Parameters<typeof fetch>[0],
 	init: Parameters<typeof fetch>[1],
 	onTiming: (timing: JevTransportTiming) => void,
+	fetchImpl: typeof globalThis.fetch = globalThis.fetch,
 ): Promise<Response> {
 	const target = new URL(typeof url === "string" ? url : url instanceof URL ? url.href : url.url);
 	const trace: Trace = {
@@ -224,7 +249,7 @@ export async function fetchWithTransportTiming(
 	signal?.addEventListener("abort", stop, { once: true });
 	if (signal?.aborted) stop();
 	try {
-		const response = await scope.run(trace, () => globalThis.fetch(url, init));
+		const response = await scope.run(trace, () => fetchImpl(url, init));
 		trace.ambiguous ||= response.redirected;
 		return response;
 	} finally { stop(); }

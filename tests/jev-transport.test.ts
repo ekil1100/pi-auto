@@ -1,21 +1,18 @@
 import { createServer } from "node:http";
 import type { Socket } from "node:net";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { classifyWithJev, JEV_MODEL, selectWithJev, type JevTiming } from "../src/jev.ts";
 import { planEffort } from "../src/router.ts";
+import { createJevTransport, type TimedJevFetch } from "../src/jev-transport.ts";
 
-const local = vi.hoisted(() => ({ url: "" }));
-vi.mock("../src/jev-transport.ts", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../src/jev-transport.ts")>();
-	return { ...actual, fetchWithTransportTiming: (...args: Parameters<typeof actual.fetchWithTransportTiming>) => {
-		expect(String(args[0])).toBe("https://api.typesafe.ai/v1/systemone");
-		if (!local.url) throw new Error("External requests blocked");
-		return actual.fetchWithTransportTiming(local.url, args[1], args[2]);
-	} };
+beforeEach(() => {
+	for (const key of ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY"]) vi.stubEnv(key, undefined);
 });
+afterEach(() => vi.unstubAllEnvs());
 
 it("reuses one real connection across classification and selection without sleeps or prewarming", async () => {
+	const transport = createJevTransport();
 	const socketIds = new WeakMap<Socket, number>();
 	const requests: { purpose: string; socketId: number }[] = [];
 	let nextSocketId = 0;
@@ -45,7 +42,10 @@ it("reuses one real connection across classification and selection without sleep
 	try {
 		const address = server.address();
 		if (!address || typeof address === "string") throw new Error("Missing local server address");
-		local.url = `http://127.0.0.1:${address.port}/v1/systemone`;
+		const fetchLocal: TimedJevFetch = (url, init, onTiming) => {
+			expect(url).toBe("https://api.typesafe.ai/v1/systemone");
+			return transport.fetch(`http://127.0.0.1:${address.port}/v1/systemone`, init, onTiming);
+		};
 		const contextTimings: JevTiming[] = [], effortTimings: JevTiming[] = [];
 		const model: Model<Api> = { id: "synthetic", name: "Synthetic", api: "openai-responses", provider: "test",
 			baseUrl: "https://example.test", reasoning: true, input: ["text"],
@@ -54,8 +54,8 @@ it("reuses one real connection across classification and selection without sleep
 			currentModel: model, currentEffort: "medium", signal: AbortSignal.timeout(5_000),
 			history: [0, 1, 2].map((index) => ({ entryId: `u${index}`, role: "user", text: `Synthetic request ${index}. `.padEnd(2_500, "x") })),
 		}, async () => { throw new Error("Current-model backend must not be called"); }, {
-			classify: (invocation) => classifyWithJev("synthetic-key", { ...invocation, onTiming: (value) => contextTimings.push(structuredClone(value)) }),
-			select: (invocation) => selectWithJev("synthetic-key", { ...invocation, onTiming: (value) => effortTimings.push(structuredClone(value)) }),
+			classify: (invocation) => classifyWithJev("synthetic-key", { ...invocation, onTiming: (value) => contextTimings.push(structuredClone(value)) }, fetchLocal),
+			select: (invocation) => selectWithJev("synthetic-key", { ...invocation, onTiming: (value) => effortTimings.push(structuredClone(value)) }, fetchLocal),
 		});
 		expect(result).toMatchObject({ status: "selected", plan: { effort: "high" } });
 		expect(requests).toEqual([{ purpose: "context", socketId: 1 }, { purpose: "effort", socketId: 1 }]);
@@ -64,7 +64,7 @@ it("reuses one real connection across classification and selection without sleep
 		expect(effortTimings.at(-1)?.transport).not.toHaveProperty("connectMs");
 		for (const secret of ["synthetic-key", "Synthetic request", "127.0.0.1", "example.test"]) expect(JSON.stringify([...contextTimings, ...effortTimings])).not.toContain(secret);
 	} finally {
-		local.url = "";
+		await transport.dispose();
 		server.closeAllConnections();
 		await new Promise<void>((resolve) => { server.close(() => resolve()); });
 	}

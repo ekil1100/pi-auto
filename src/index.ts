@@ -1,5 +1,6 @@
 import {
 	getSupportedThinkingLevels,
+	clampThinkingLevel,
 	modelsAreEqual,
 	uuidv7,
 	type Api,
@@ -7,12 +8,13 @@ import {
 	type Model,
 	type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
-import type { BeforeAgentStartEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SettingsManager, type BeforeAgentStartEvent, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { planEffort, type CompleteRouter, type RouterInvocation, type JevBackend, type RoutingDiagnostics } from "./router.ts";
 import { JEV_MODEL, selectWithJev, classifyWithJev, type JevTiming } from "./jev.ts";
 import { collectHistory, hasContextImages } from "./session-context.ts";
 import { createSelectingWidget, DECISION_ENTRY_TYPE, formatAutoEffort, readDecision, renderDecisionEntry, type EffortDecision } from "./selection-ui.ts";
 import { showAutoStatus } from "./status-ui.ts";
+import { createJevTransport } from "./jev-transport.ts";
 
 const ROUTER_TIMEOUT_MS = 10_000;
 const ROUTER_MAX_OUTPUT_TOKENS = 2_048;
@@ -20,6 +22,7 @@ const STATUS_KEY = "pi-auto";
 const PROGRESS_KEY = "pi-auto-selecting";
 
 export default function piAuto(pi: ExtensionAPI): void {
+	const jevTransport = createJevTransport();
 	let enabled = true;
 	let lastDecision: EffortDecision | undefined;
 	let activeSelection: AbortController | undefined;
@@ -70,18 +73,22 @@ export default function piAuto(pi: ExtensionAPI): void {
 	pi.on("session_tree", (_event, ctx) => restore(ctx));
 	pi.on("model_select", (_event, ctx) => { invalidateSelection(); updateFooter(ctx, enabled); });
 	pi.on("thinking_level_select", (event, ctx) => { invalidateSelection(); updateFooter(ctx, enabled, event.level); });
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		stopped = true;
 		activeSelection?.abort();
 		ctx.ui.setWidget(PROGRESS_KEY, undefined);
 		ctx.ui.setStatus(STATUS_KEY, undefined);
+		await jevTransport.dispose();
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (!enabled || stopped) return;
+		if (!enabled || stopped || ctx.signal?.aborted) return;
 		const controller = new AbortController();
+		const userSignal = ctx.signal;
+		const onUserAbort = () => controller.abort("user_cancelled");
+		userSignal?.addEventListener("abort", onUserAbort, { once: true });
 		activeSelection = controller;
-		const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(ROUTER_TIMEOUT_MS)]);
+		const initialModel = ctx.model;
 		const startedAt = performance.now();
 		const initialRevision = selectionRevision;
 		const previousEffort = ctx.thinkingLevel ?? "off";
@@ -97,43 +104,74 @@ export default function piAuto(pi: ExtensionAPI): void {
 		const selectorUsage: NonNullable<EffortDecision["selectorUsage"]> = {};
 		const interrupted = (): Pick<EffortDecision, "status" | "reason"> => controller.signal.reason === "settings_changed"
 			? { status: "kept", reason: "Model, effort or session changed during selection" }
-			: { status: "cancelled", reason: "Auto disabled during selection" };
+			: { status: "cancelled", reason: controller.signal.reason === "user_cancelled" ? "Selection cancelled by user" : "Auto disabled during selection" };
 		const typesafeApiKey = process.env.TYPESAFE_API_KEY?.trim();
+		const settingsChanged = () => initialRevision !== selectionRevision || !modelsAreEqual(ctx.model, initialModel) ||
+			(ctx.thinkingLevel ?? "off") !== previousEffort;
+		let primaryFailure: string | undefined;
 		let outcome: Pick<EffortDecision, "status" | "reason"> = { status: "kept", reason: "Selection interrupted" };
+		const runSelection = async (useJev: boolean) => {
+			const attempt = new AbortController();
+			const signal = AbortSignal.any([controller.signal, attempt.signal, AbortSignal.timeout(ROUTER_TIMEOUT_MS)]);
+			let acceptingDiagnostics = true;
+			try {
+				return await planForEvent(event, ctx, signal, (invocation) => {
+					prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
+					routerModel = modelKey(invocation.model);
+					routerEffort = invocation.effort;
+					return completeRouter(ctx, invocation, (usage) => { if (acceptingDiagnostics) selectorUsage[invocation.purpose] = usage; });
+				}, useJev && typesafeApiKey ? {
+					select: async (invocation) => {
+						prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
+						routerModel = `typesafe/${JEV_MODEL}`;
+						const decision = await selectWithJev(typesafeApiKey, {
+							...invocation, onTiming: (timing) => { if (acceptingDiagnostics) jevTiming = structuredClone(timing); },
+						}, jevTransport.fetch);
+						if (acceptingDiagnostics) {
+							routerModel = `typesafe/${decision.model}`;
+							routerConfidence = decision.confidence;
+							routerProbabilities = { ...decision.probabilities };
+						}
+						return decision;
+					},
+					classify: async (invocation) => {
+						prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
+						routerModel = `typesafe/${JEV_MODEL}`;
+						return classifyWithJev(typesafeApiKey, {
+							...invocation, onTiming: (timing) => { if (acceptingDiagnostics) contextTiming = structuredClone(timing); },
+							onDecisions: (values) => { if (acceptingDiagnostics) contextDecisions = structuredClone(values); },
+						}, jevTransport.fetch);
+					},
+				} : undefined, (value) => { if (acceptingDiagnostics) routing = structuredClone(value); });
+			} finally {
+				// Freeze this attempt's diagnostics before aborting any non-cooperative work.
+				acceptingDiagnostics = false;
+				attempt.abort();
+			}
+		};
 		ctx.ui.setWidget(PROGRESS_KEY, createSelectingWidget);
 		try {
-			const result = await planForEvent(event, ctx, signal, (invocation) => {
-				prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
-				routerModel = modelKey(invocation.model);
-				routerEffort = invocation.effort;
-				return completeRouter(ctx, invocation, (usage) => { selectorUsage[invocation.purpose] = usage; });
-			}, typesafeApiKey ? {
-				select: async (invocation) => {
-					prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
-					routerModel = `typesafe/${JEV_MODEL}`;
-					const decision = await selectWithJev(typesafeApiKey, {
-						...invocation, onTiming: (timing) => { jevTiming = structuredClone(timing); },
-					});
-					routerModel = `typesafe/${decision.model}`;
-					routerConfidence = decision.confidence;
-					routerProbabilities = { ...decision.probabilities };
-					return decision;
-				},
-				classify: async (invocation) => {
-					prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
-					routerModel = `typesafe/${JEV_MODEL}`;
-					return classifyWithJev(typesafeApiKey, {
-						...invocation, onTiming: (timing) => { contextTiming = structuredClone(timing); },
-						onDecisions: (values) => { contextDecisions = structuredClone(values); },
-					});
-				},
-			} : undefined, (value) => { routing = structuredClone(value); });
+			let result;
+			try {
+				result = await runSelection(Boolean(typesafeApiKey));
+			} catch (error) {
+				if (!typesafeApiKey || controller.signal.aborted || !enabled || stopped || settingsChanged()) throw error;
+				primaryFailure = errorMessage(error);
+				routerModel = undefined;
+				routerEffort = undefined;
+				routerConfidence = undefined;
+				routerProbabilities = undefined;
+				contextDecisions = undefined;
+				routing = undefined;
+				result = await runSelection(false);
+			}
 			if (controller.signal.aborted || !enabled) {
 				outcome = interrupted();
 				return;
 			}
 			if (result.status === "skipped") {
-				outcome = { status: "kept", reason: result.reason };
+				outcome = { status: "kept", reason: primaryFailure
+					? `Jev failed (${primaryFailure}); current-model fallback skipped: ${result.reason}` : result.reason };
 				return;
 			}
 
@@ -145,12 +183,27 @@ export default function piAuto(pi: ExtensionAPI): void {
 			// The notification from our own setter must not cancel the completed decision.
 			if (activeSelection === controller) activeSelection = undefined;
 			if (previousEffort !== plan.effort) pi.setThinkingLevel(plan.effort);
-			outcome = { status: "selected", reason: plan.reason };
+			outcome = { status: "selected", reason: primaryFailure
+				? `Jev failed (${primaryFailure}); current-model fallback: ${plan.reason}` : plan.reason };
 		} catch (error) {
-			outcome = controller.signal.aborted
-				? interrupted()
-				: { status: "kept", reason: errorMessage(error) };
+			if (controller.signal.aborted || !enabled || stopped) {
+				outcome = interrupted();
+			} else if (settingsChanged()) {
+				outcome = { status: "kept", reason: "Model or effort changed during selection" };
+			} else {
+				const failure = primaryFailure ? `Jev failed (${primaryFailure}); current-model fallback failed: ${errorMessage(error)}` : errorMessage(error);
+				try {
+					if (!initialModel) throw new Error("No current model is selected");
+					const effort = configuredDefaultEffort(ctx, initialModel);
+					if (activeSelection === controller) activeSelection = undefined;
+					if (previousEffort !== effort) pi.setThinkingLevel(effort);
+					outcome = { status: previousEffort === effort ? "kept" : "selected", reason: `${failure}; restored Pi default effort (${effort})` };
+				} catch {
+					outcome = { status: "kept", reason: `${failure}; Pi default effort unavailable` };
+				}
+			}
 		} finally {
+			userSignal?.removeEventListener("abort", onUserAbort);
 			if (activeSelection === controller) activeSelection = undefined;
 			if (!stopped) {
 				ctx.ui.setWidget(PROGRESS_KEY, undefined);
@@ -233,6 +286,7 @@ async function completeRouter(
 				...(auth.headers !== undefined ? { headers: auth.headers } : {}),
 				...(auth.env !== undefined ? { env: auth.env } : {}),
 				signal: invocation.signal,
+				maxRetries: 0,
 				maxTokens: Math.min(ROUTER_MAX_OUTPUT_TOKENS, invocation.model.maxTokens),
 				cacheRetention: "none",
 				sessionId: uuidv7(),
@@ -266,6 +320,17 @@ async function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise
 	} finally {
 		signal.removeEventListener("abort", onAbort);
 	}
+}
+
+function configuredDefaultEffort(ctx: ExtensionContext, model: Model<Api>): ModelThinkingLevel {
+	const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted: ctx.isProjectTrusted() });
+	if (settings.drainErrors().length) throw new Error("Pi default effort settings could not be read");
+	// Match Pi's per-model/global precedence and its built-in default when neither is configured.
+	const perModel = settings.getModelThinkingLevel(model.provider, model.id);
+	const global = settings.getDefaultThinkingLevel();
+	const effort = perModel !== undefined ? perModel : global !== undefined ? global : "medium";
+	if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(effort)) throw new Error("Invalid Pi default effort");
+	return clampThinkingLevel(model, effort);
 }
 
 function updateFooter(ctx: ExtensionContext, enabled: boolean, effort: ModelThinkingLevel = ctx.thinkingLevel ?? "off"): void {

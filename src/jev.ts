@@ -2,7 +2,7 @@ import { setImmediate } from "node:timers/promises";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { APIError, APITimeoutError, choice, TypeSafeClient, type EntryType, type Questions } from "@typesafe-ai/sdk";
 import type { EffortState } from "./router.ts";
-import { fetchWithTransportTiming, type JevTransportTiming } from "./jev-transport.ts";
+import type { JevTransportTiming, TimedJevFetch } from "./jev-transport.ts";
 import type { ContextRating } from "./context-compaction.ts";
 import { CONTEXT_INSTRUCTIONS, IMPORTANCE_CRITERIA, type ContextClassificationInput } from "./context-policy.ts";
 import { EFFORT_INSTRUCTIONS, getEffortCriteria } from "./effort-policy.ts";
@@ -37,7 +37,7 @@ export interface JevDecision {
 
 export type SelectJev = (invocation: JevInvocation) => Promise<JevDecision>;
 
-export async function selectWithJev(apiKey: string, invocation: JevInvocation): Promise<JevDecision> {
+export async function selectWithJev(apiKey: string, invocation: JevInvocation, fetchJev: TimedJevFetch): Promise<JevDecision> {
 	return requestJev(apiKey, invocation, {
 		effort: choice(EFFORT_INSTRUCTIONS, getEffortCriteria(invocation.state.supportedEfforts)),
 	}, (response) => {
@@ -45,7 +45,7 @@ export async function selectWithJev(apiKey: string, invocation: JevInvocation): 
 		const answer = parseChoice(answers.effort, invocation.state.supportedEfforts);
 		const effort = invocation.state.supportedEfforts.find((candidate) => candidate === answer.choice)!;
 		return { effort, model, confidence: answer.confidence, probabilities: answer.probabilities };
-	});
+	}, fetchJev);
 }
 
 export type JevContextDecision = ContextRating & { confidence: number; probabilities: Record<string, number> };
@@ -54,7 +54,7 @@ export type JevContextInvocation = ContextClassificationInput & {
 	onDecisions?: (decisions: JevContextDecision[]) => void;
 };
 
-export async function classifyWithJev(apiKey: string, input: JevContextInvocation): Promise<ContextRating[]> {
+export async function classifyWithJev(apiKey: string, input: JevContextInvocation, fetchJev: TimedJevFetch): Promise<ContextRating[]> {
 	const keys = input.candidates.map((_candidate, index) => `block_${index}`);
 	const questions = Object.fromEntries(input.candidates.map((_candidate, index) => [keys[index]!,
 		choice(`${CONTEXT_INSTRUCTIONS}\nEvaluate candidates[${index}].text and its turn dependencies.`, IMPORTANCE_CRITERIA),
@@ -71,7 +71,7 @@ export async function classifyWithJev(apiKey: string, input: JevContextInvocatio
 		});
 		try { input.onDecisions?.(structuredClone(decisions)); } catch { /* Diagnostics must not change selection. */ }
 		return decisions.map(({ id, importance }) => ({ id, importance }));
-	});
+	}, fetchJev);
 }
 
 async function requestJev<T>(
@@ -79,6 +79,7 @@ async function requestJev<T>(
 	{ state, signal, onTiming }: { state: EntryType; signal: AbortSignal; onTiming?: JevInvocation["onTiming"] },
 	questions: Questions,
 	parse: (response: unknown) => T,
+	fetchJev: TimedJevFetch,
 ): Promise<T> {
 	const startedAt = performance.now();
 	const timing: JevTiming = {};
@@ -105,7 +106,7 @@ async function requestJev<T>(
 				timing.setupMs = elapsed(startedAt);
 				if (typeof init?.body === "string") timing.requestBytes = Buffer.byteLength(init.body, "utf8");
 				report();
-				const response = await fetchWithTransportTiming(url, init, (transport) => {
+				const response = await fetchJev(url, init, (transport) => {
 					timing.transport = { ...transport };
 					report();
 				});

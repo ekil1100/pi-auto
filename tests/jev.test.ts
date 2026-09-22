@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { JEV_MODEL, classifyWithJev, selectWithJev, type JevContextInvocation, type JevInvocation, type JevTiming } from "../src/jev.ts";
+import { JEV_MODEL, classifyWithJev as classify, selectWithJev as select, type JevContextInvocation, type JevInvocation, type JevTiming } from "../src/jev.ts";
+import { fetchWithTransportTiming } from "../src/jev-transport.ts";
+
+const selectWithJev = (key: string, input: JevInvocation) => select(key, input, fetchWithTransportTiming);
+const classifyWithJev = (key: string, input: JevContextInvocation) => classify(key, input, fetchWithTransportTiming);
 
 const invocation: JevInvocation = {
 	state: {
