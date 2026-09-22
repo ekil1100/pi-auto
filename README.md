@@ -1,83 +1,120 @@
 # pi-auto
 
-Pi 扩展：每次任务开始前，自动选择当前模型的 thinking effort（思考强度）。**只调整 effort，不切换模型。**
+English | [简体中文](./README.zh-CN.md)
 
-## 安装与使用
+A Pi extension that automatically selects the current model's thinking effort before each task. **It adjusts effort only—never switches your model.**
+
+## Install and use
+
+Requires Node.js **22.19.0 or later** and Pi.
 
 ```bash
 pi install npm:pi-auto
 ```
 
-通过 `/model` 选择模型即可，无需配置 scoped models。扩展默认开启，底栏显示 `auto · low` 等当前档位。
+Choose your model with `/model`; no scoped-model configuration is needed. The extension is enabled by default, and the footer shows the current effort, such as `auto · low`.
 
-## 可选：使用 Jev
+By default, your current model also selects the effort. You can optionally use Jev as the selector instead.
 
-默认由当前模型判断 effort。若要改用 TypeSafe Jev，在启动 Pi 的终端中设置：
+## Optional: use Jev
+
+Set a TypeSafe API key in the terminal where you start Pi:
 
 ```bash
 export TYPESAFE_API_KEY="your-api-key"
 pi
 ```
 
-密钥未设置、为空或只有空白时，使用当前模型。修改 shell 环境变量后需重新启动 Pi；用 `/auto status` 确认当前后端。
+An unset, empty, or whitespace-only key uses the current-model selector. Restart Pi after changing shell environment variables. Use `/auto status` to inspect the configured backend and the latest selection, including any fallback.
 
-Jev 使用独立的 Undici 连接池，**自动读取代理环境变量，无需 `NODE_USE_ENV_PROXY=1`**：
+**Enabling Jev sends your current task and relevant conversation history to TypeSafe without automatic redaction.** Raw tool results and image data are not sent directly, but existing summaries may contain information obtained through tools. For sensitive tasks, disable automatic selection, or unset the key and restart Pi. See the [TypeSafe privacy policy](https://typesafe.ai/legal/privacy-policy).
 
-- 支持 `http_proxy` / `https_proxy` / `no_proxy` 及其大写形式，小写优先。
-- HTTPS 请求优先用 `https_proxy`，未设置时用 `http_proxy`；`no_proxy` 匹配的地址直连。
-- 没有这些代理配置时直连；不读取 `ALL_PROXY` / `all_proxy`，仅设置它们时请同时设置 `https_proxy`。
-- 仅影响本插件的 Jev 请求，不修改 Pi 的全局网络设置；代理失败不把 Jev 改为直连，而是由当前模型接管选档。修改启动终端的代理变量后，请重启 Pi。
+### Proxy support
 
-**启用 Jev 会向 TypeSafe 发送当前任务及相关历史文本，内容不会自动脱敏。** 不直接发送图片数据或工具结果原文，但已有摘要可能包含工具获得的信息。涉及机密内容时，请关闭自动选择，或取消该环境变量并重启 Pi。参阅 [TypeSafe 隐私政策](https://typesafe.ai/legal/privacy-policy)。
+Jev uses its own Undici connection pool and reads proxy environment variables automatically. **`NODE_USE_ENV_PROXY=1` is not required.**
 
-## 命令
+- Supports `http_proxy`, `https_proxy`, and `no_proxy`, plus their uppercase variants. Lowercase takes precedence.
+- HTTPS requests use `https_proxy`, falling back to `http_proxy` when it is not configured. Hosts matched by `no_proxy` bypass the proxy.
+- Without these proxy settings, requests connect directly. `ALL_PROXY` / `all_proxy` is not read; if that is your only proxy variable, also set `https_proxy`.
+- These settings apply only to this extension's Jev requests, not Pi's global network configuration. A proxy failure does not trigger a direct Jev retry; the current model takes over effort selection.
 
-| 命令 | 用途 |
+Restart Pi after changing proxy variables in its launch terminal.
+
+## Commands
+
+| Command | Action |
 | --- | --- |
-| `/auto` 或 `/auto toggle` | 切换自动选择 |
-| `/auto on` | 开启 |
-| `/auto off` | 关闭 |
-| `/auto status` | 查看当前后端、effort 和最近一次选择详情 |
+| `/auto` or `/auto toggle` | Toggle automatic selection |
+| `/auto on` | Enable automatic selection |
+| `/auto off` | Disable automatic selection and cancel a pending selection |
+| `/auto status` | Inspect the backend, effort, and latest selection |
 
-开关只作用于当前扩展实例，重启或重载后默认开启。要固定 effort，先 `/auto off`，再用 `/thinking` 设置；关闭自动选择不等于将 effort 设为 `off`。
+The toggle applies to the current extension instance; restarting or reloading enables it again. To use a fixed effort, run `/auto off`, then choose a level with `/thinking`. Disabling automatic selection does **not** set effort to `off`.
 
-选择结果会保留在对话中，默认折叠。按默认快捷键 **Ctrl+O** 展开，仅显示档位变化、理由、后端、总耗时和上下文摘要。
+### Inspect a selection
 
-`/auto status` 在交互终端打开只读浮窗，内容是打开时的快照：
+Selection results appear in the conversation, collapsed by default. Use the default **Ctrl+O** shortcut to expand the effort change, reason, selector, elapsed time, and context summary.
 
-- **Overview（概览）**：分开显示当前状态与最近一次选择，失败原因优先展示。
-- **Context（上下文）**：查看候选片段的来源 ID、角色、字符范围、重要性分类及是否入选。分类与入选分开显示；没有分类或旧记录缺少关联信息时明确标记，不推测。
-- **Diagnostics（诊断）**：查看策略、概率、用量及两阶段的耗时和连接信息。
+In an interactive terminal, `/auto status` opens a read-only overlay with three pages:
 
-默认 **Tab** 切页、**↑↓ / PageUp / PageDown** 滚动、**Esc** 关闭；也支持 **j 向下 / k 向上**滚动。自定义键位优先于 j/k 别名，以浮窗提示为准。查看状态不会重新选档、调用模型或改变 effort，也不展示或额外保存会话正文。RPC 客户端通过文本通知查看同一份分组信息。
+- **Overview:** current state and the latest selection, with failure reasons shown first.
+- **Context:** candidate source IDs, roles, character ranges, importance ratings, and actual retention. Ratings and retention are shown separately; missing classification or older metadata is marked as unknown rather than inferred.
+- **Diagnostics:** policy, probabilities, usage, and timing and connection details for classification and effort selection.
 
-## 行为与限制
+Default controls: **Tab** to change pages, **↑↓ / PageUp / PageDown** to scroll, **j / k** to scroll down/up, and **Esc** to close. Explicit custom keybindings take precedence over j/k aliases; follow the displayed hints.
 
-- 只选择当前模型支持的档位；只有一个可用档位时直接使用，不额外调用模型。
-- 每个后端通常额外调用一次选档接口；历史过长时先分类、抽取原文片段，再选档，最多两次串行调用。若 Jev 失败后回退到当前模型，会重新处理上下文，合计最多四次调用。筛选只影响选档输入，不修改主模型的会话上下文。
-- **额外调用会产生费用和等待时间**，用量目前不计入 Pi footer 的主调用统计。
-- Jev 请求失败、超时或返回无效结果后，**不重试 Jev，直接由当前模型接管选档一次**；不切换主模型。当前模型也失败时，直接恢复 **Pi 配置的默认 effort**，让原任务继续。
-- 每个后端的分类与选档共享 **10 秒期限**；回退到当前模型时使用独立的 10 秒期限，两次尝试最多约 20 秒。两个后端均禁用请求重试。
-- 默认 effort 从 Pi 的全局及已信任项目 `settings.json` 读取：当前模型的 `modelThinkingLevels["provider/modelId"]` 优先，其次 `defaultThinkingLevel`，均未配置时按 Pi 内置默认值 `medium`。超出模型能力时按 Pi 规则调整，不使用上一次自动选出的档位作为默认值，也不修改配置文件。配置无法读取或无效时保留当前 effort，并在状态中说明。
-- 收到运行时取消信号、关闭自动选择或切换模型、effort、会话时，不启动回退，也不覆盖用户的新设置。Pi 的 `before_agent_start` 阶段可能没有运行时取消信号；此时可用 `/auto off` 取消选档。任一后端因必要上下文超预算而跳过选档时，保留当前 effort，不视为连接失败。
-- 等待期间切换模型、effort、会话或关闭自动选择，会使在途结果失效。
-- 选档输入有长度限制，可能遗漏历史；自动判断不保证最优。Jev 的 confidence 不是任务成功率，也不用于自动升降档。
+The view is a snapshot taken when opened. Inspecting it does not call a model, rerun selection, or change effort. It shows selection metadata, not request payloads. RPC clients receive the same grouped information as a text notification.
 
-### 选档输入与外发范围
+## Failure handling
 
-以下长度均按 JavaScript `.length` 计数（**UTF-16 代码单元**，不是 token 或字节），仅限制选档输入，不限制主模型会话：
+With Jev enabled, the fallback chain is:
 
-| 输入 | 最大范围 |
+```text
+Jev fails once → current model selects effort → if that fails, restore Pi's configured default effort
+```
+
+There are no request retries and no main-model switch. Jev request failures, timeouts, and invalid decisions trigger the current-model fallback. Without Jev, a failed current-model selection also restores the configured default effort.
+
+Each backend has a **10-second deadline shared by classification and effort selection**. The current-model fallback gets its own 10-second deadline, so both attempts can take approximately 20 seconds in total.
+
+Default effort is read from Pi's saved global and trusted-project `settings.json` files, in this order:
+
+1. `modelThinkingLevels["provider/modelId"]` for the current model.
+2. `defaultThinkingLevel`.
+3. Pi's built-in default, `medium`, if neither is configured.
+
+The level is adjusted to the model's capabilities using Pi's rules. The previous automatically selected effort is not treated as the default, and configuration files are not modified. If the relevant configuration is invalid or cannot be read, the current effort is kept and the status explains why.
+
+Runtime cancellation signals, `/auto off`, and changes to the model, effort, or session invalidate pending results. They do not trigger fallback or overwrite the user's new settings. Pi may not expose a cancellation signal during `before_agent_start`; use `/auto off` to cancel selection in that case.
+
+If required history exceeds the context budget, either backend can skip selection. This keeps the current effort and is not treated as a connection failure.
+
+## Costs and limits
+
+- Only effort levels supported by the current model can be selected. A model with just one supported level uses it without an extra model call.
+- Each backend normally makes one selection call. Long history adds a classification call first. A Jev failure followed by a current-model fallback rebuilds the selection context, for up to **four calls** in total.
+- **These extra calls add latency and may incur charges.** Their usage is not currently included in Pi's footer statistics for the main model.
+- Context filtering affects only the selector's input, not the main model's conversation context.
+- Input limits can omit relevant history, and automatic selection is not guaranteed to be optimal. Jev confidence is not a task-success probability and does not independently raise or lower effort.
+
+### Selector input and data sent
+
+Lengths below use JavaScript `.length`: **UTF-16 code units**, not tokens or bytes. They limit selector input, not the main model's conversation.
+
+| Input | Maximum |
 | --- | --- |
-| 当前任务 | 12,000；超长时保留首尾，独立于历史预算 |
-| 长历史分类请求的候选历史 | 完整候选 JSON 最多 24,000，最多 32 个片段，包含来源标签等元数据 |
-| 最终选档请求的历史 | 6,000，包含来源标签、遗漏标记和分隔符 |
+| Current task | 12,000; oversized tasks retain the beginning and end, independently of the history budget |
+| Candidate history for classification | 24,000 for the complete candidate JSON, up to 32 fragments, including source labels and other metadata |
+| History for final effort selection | 6,000, including source labels, omission markers, and separators |
 
-短历史通常只发送一次选档请求；长历史先发送**当前任务＋候选历史**进行分类，再发送**当前任务＋筛选后的历史**进行选档。因此分类阶段可看到比最终选档更多的历史。规则提示、模型及档位信息等另计，这些数字不是整个 HTTP 请求或服务端 token 用量的上限。启用 Jev 时，上述两阶段输入均发送给 TypeSafe，且不会自动脱敏。
+Short history usually needs only the effort-selection request. Long history first sends **the current task + candidate history** for classification, then **the current task + selected history** for effort selection. Classification can therefore expose more history than the final selection request.
 
-## 开发
+Instructions, model information, and effort options are additional input; these limits are not caps on the complete HTTP request or server-side token usage. With Jev enabled, both Jev stages send their inputs to TypeSafe without automatic redaction. On fallback, the current model's provider receives the inputs needed for its own classification and selection.
+
+## Development
 
 ```bash
+npm ci --ignore-scripts
 npm run check
 npm test
 ```
