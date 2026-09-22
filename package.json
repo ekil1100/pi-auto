@@ -47,5 +47,8 @@
   },
   "engines": {
     "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0"
   }
 }

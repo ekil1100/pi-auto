@@ -1,4 +1,6 @@
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { JevTiming, JevContextDecision } from "./jev.ts";
+import type { RoutingDiagnostics } from "./router.ts";
 import { keyHint, type EntryRenderer, type SessionEntry, type Theme } from "@earendil-works/pi-coding-agent";
 import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
 
@@ -17,11 +19,35 @@ export interface EffortDecision {
 	reason: string;
 	routerModel: string | undefined;
 	routerEffort: Exclude<ModelThinkingLevel, "off"> | undefined;
+	routerConfidence?: number;
+	prepareMs?: number;
+	jevTiming?: JevTiming;
+	contextTiming?: JevTiming;
+	contextDecisions?: JevContextDecision[];
+	routerProbabilities?: Record<string, number>;
+	routing?: RoutingDiagnostics;
+	selectorUsage?: Partial<Record<"context" | "effort", { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }>>;
 	elapsedMs: number;
 }
 
 export function formatAutoEffort(theme: Theme, effort: ModelThinkingLevel): string {
 	return theme.fg("accent", "auto") + theme.fg("dim", " · ") + theme.getThinkingBorderColor(effort)(effort);
+}
+
+export function formatJevTiming(timing: JevTiming): string {
+	const labels = { setupMs: "setup", headersMs: "headers", bodyAndDecodeMs: "body/decode", validateMs: "validate", totalMs: "total" } as const;
+	const parts = Object.entries(labels).flatMap(([key, label]) => {
+		const value = timing[key as keyof typeof labels];
+		return value === undefined ? [] : [`${label} ${value.toFixed(1)}ms`];
+	});
+	const transport = timing.transport;
+	if (transport) {
+		parts.push(`transport ${transport.status}`, `connection ${transport.connection}`);
+		if (transport.socketId !== undefined) parts.push(`socket #${transport.socketId}`);
+		if (transport.connectMs !== undefined) parts.push(`connect ${transport.connectMs.toFixed(1)}ms`);
+		if (transport.afterUploadMs !== undefined) parts.push(`after-upload ${transport.afterUploadMs.toFixed(1)}ms`);
+	}
+	return parts.join(" · ");
 }
 
 /** Spinning progress row shown while the effort request is pending; stops when the widget is cleared. */
@@ -53,15 +79,24 @@ export const renderDecisionEntry: EntryRenderer<EffortDecision> = (entry, { expa
 		detail("Model", theme.fg("text", inlineText(decision.model))),
 		detail("Effort", theme.getThinkingBorderColor(decision.previousEffort)(decision.previousEffort) +
 			theme.fg("dim", " → ") + theme.getThinkingBorderColor(decision.effort)(decision.effort)),
-		detail("Selector", decision.routerEffort
-			? theme.fg("text", inlineText(decision.routerModel ?? decision.model)) + theme.fg("dim", " @ ") +
-				theme.getThinkingBorderColor(decision.routerEffort)(decision.routerEffort)
+		detail("Selector", decision.routerModel
+			? theme.fg("text", inlineText(decision.routerModel)) + (decision.routerEffort
+				? theme.fg("dim", " @ ") + theme.getThinkingBorderColor(decision.routerEffort)(decision.routerEffort)
+				: "")
 			: theme.fg("dim", "not called")),
-		detail("Reason", theme.fg("text", inlineText(decision.reason))),
+		detail(decision.status === "selected" ? "Reason" : "Kept because", theme.fg(decision.status === "selected" ? "text" : "warning", inlineText(decision.reason))),
 		detail("Elapsed", theme.fg("dim", `${(decision.elapsedMs / 1000).toFixed(1)}s`)),
+		...(decision.routing?.compaction ? [detail("Context", theme.fg("text", formatContextSummary(decision.routing.compaction)))] : []),
+		theme.fg("dim", "  /auto status: inspect the latest decision"),
 	];
 	return new Text(lines.join("\n"), 1, 0);
 };
+
+export function formatContextSummary(context: NonNullable<RoutingDiagnostics["compaction"]>): string {
+	if (context.status === "failed" || context.status === "extracting") return `${context.status} · no packed context`;
+	const omitted = context.candidatesTruncated || context.selectedCount < context.candidateCount;
+	return `${context.selectedCount} of ${context.candidateCount} blocks retained · omitted: ${omitted ? "yes" : "no"}`;
+}
 
 export function readDecision(entry: SessionEntry): EffortDecision | undefined {
 	if (entry.type !== "custom" || entry.customType !== DECISION_ENTRY_TYPE) return undefined;
@@ -72,8 +107,76 @@ export function readDecision(entry: SessionEntry): EffortDecision | undefined {
 		!isEffort(data.previousEffort) || !isEffort(data.effort) ||
 		(data.routerModel !== undefined && typeof data.routerModel !== "string") ||
 		(data.routerEffort !== undefined && (!isEffort(data.routerEffort) || data.routerEffort === "off")) ||
+		(data.routerConfidence !== undefined && (typeof data.routerConfidence !== "number" ||
+			!Number.isFinite(data.routerConfidence) || data.routerConfidence < 0 || data.routerConfidence > 1)) ||
+		(data.prepareMs !== undefined && !isNonnegativeNumber(data.prepareMs)) ||
+		(data.jevTiming !== undefined && !isJevTiming(data.jevTiming)) ||
+		(data.contextTiming !== undefined && !isJevTiming(data.contextTiming)) ||
+		(data.contextDecisions !== undefined && (!Array.isArray(data.contextDecisions) || data.contextDecisions.length > 32 ||
+			!data.contextDecisions.every((item: unknown) => isRecord(item) && typeof item.id === "string" &&
+				["required", "useful", "background", "irrelevant"].includes(String(item.importance)) &&
+				isNonnegativeNumber(item.confidence) && item.confidence <= 1 && isRecord(item.probabilities) &&
+				Object.keys(item.probabilities).length === 4 && Object.entries(item.probabilities).every(([key, value]) =>
+					["required", "useful", "background", "irrelevant"].includes(key) && isNonnegativeNumber(value) && value <= 1)))) ||
+		(data.routerProbabilities !== undefined && (!isRecord(data.routerProbabilities) ||
+			!Object.entries(data.routerProbabilities).every(([key, value]) => isEffort(key) && isNonnegativeNumber(value) && value <= 1))) ||
+		(data.routing !== undefined && !isRoutingDiagnostics(data.routing)) ||
+		(data.selectorUsage !== undefined && (!isRecord(data.selectorUsage) || !Object.entries(data.selectorUsage).every(([key, value]) =>
+			["context", "effort"].includes(key) && isRecord(value) && ["input", "output", "cacheRead", "cacheWrite", "cost"].every((field) => isNonnegativeNumber(value[field]))))) ||
 		typeof data.elapsedMs !== "number" || !Number.isFinite(data.elapsedMs) || data.elapsedMs < 0) return undefined;
 	return data as unknown as EffortDecision;
+}
+
+function isNonnegativeNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isJevTiming(value: unknown): value is JevTiming {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const fields = ["setupMs", "headersMs", "bodyAndDecodeMs", "validateMs", "totalMs", "requestBytes", "httpStatus", "inputTokens", "outputTokens"];
+	return Object.entries(value).every(([key, item]) => key === "transport" ? isTransportTiming(item) : fields.includes(key) && isNonnegativeNumber(item));
+}
+
+function isTransportTiming(value: unknown): boolean {
+	if (!isRecord(value) || typeof value.status !== "string" || !["observed", "partial", "unavailable", "ambiguous"].includes(value.status) ||
+		typeof value.connection !== "string" || !["new", "reused", "unknown"].includes(value.connection) ||
+		!isNonnegativeNumber(value.requestCount) || !Number.isSafeInteger(value.requestCount)) return false;
+	const numeric = ["connectMs", "sendHeadersMs", "bodySentMs", "responseHeadersMs", "afterUploadMs"];
+	return Object.entries(value).every(([key, item]) => {
+		if (["status", "connection", "requestCount"].includes(key)) return true;
+		if (key === "socketId") return isNonnegativeNumber(item) && Number.isSafeInteger(item) && item > 0;
+		return numeric.includes(key) && isNonnegativeNumber(item);
+	});
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isRoutingDiagnostics(value: unknown): value is RoutingDiagnostics {
+	if (!isRecord(value) || typeof value.policyVersion !== "string" || !/^\d{1,8}$/.test(value.policyVersion) ||
+		!Array.isArray(value.supportedEfforts) || value.supportedEfforts.length > 7 || !value.supportedEfforts.every(isEffort) ||
+		typeof value.taskTruncated !== "boolean" || (value.selectionMs !== undefined && !isNonnegativeNumber(value.selectionMs))) return false;
+	const context = value.compaction;
+	if (context === undefined) return true;
+	if (!isRecord(context) || !["bypassed", "extracting", "extracted", "failed"].includes(String(context.status)) ||
+		typeof context.candidatesTruncated !== "boolean" ||
+		!["candidateCount", "candidateCharacters", "selectedCount", "selectedCharacters"].every((key) => isNonnegativeNumber(context[key])) ||
+		(context.elapsedMs !== undefined && !isNonnegativeNumber(context.elapsedMs)) ||
+		(context.reason !== undefined && (typeof context.reason !== "string" || !/^[a-z_]{1,100}$/.test(context.reason))) ||
+		!Array.isArray(context.sources) || context.sources.length > 32 || !Array.isArray(context.ratings) || context.ratings.length > 32) return false;
+	if (context.candidateSources !== undefined && (!Array.isArray(context.candidateSources) || context.candidateSources.length > 32 ||
+		!context.candidateSources.every((source: unknown) => isContextSource(source) && typeof source.id === "string" &&
+			Object.keys(source).every((key) => ["id", "entryId", "role", "start", "end"].includes(key))))) return false;
+	return context.sources.every(isContextSource) &&
+		context.ratings.every((rating: unknown) => isRecord(rating) && typeof rating.id === "string" &&
+			["required", "useful", "background", "irrelevant"].includes(String(rating.importance)));
+}
+
+function isContextSource(source: unknown): source is Record<string, unknown> {
+	return isRecord(source) && typeof source.entryId === "string" &&
+		["user", "assistant", "summary"].includes(String(source.role)) && isNonnegativeNumber(source.start) &&
+		isNonnegativeNumber(source.end) && source.end >= source.start;
 }
 
 function isEffort(value: unknown): value is ModelThinkingLevel {
