@@ -12,7 +12,7 @@ Pi 扩展：每次任务开始前，自动选择当前模型的 thinking effort�
 pi install npm:pi-auto
 ```
 
-通过 `/model` 选择模型即可，无需配置 scoped models。扩展默认开启，底栏显示 `auto · low` 等当前档位。
+通过 `/model` 选择模型即可，无需配置 scoped models。未设置启动默认值时扩展默认开启，底栏显示 `auto · low` 等当前档位。
 
 默认由当前模型判断 effort，也可以选择使用 Jev 作为选档后端。
 
@@ -54,8 +54,14 @@ Jev 使用独立的 Undici 连接池，自动读取代理环境变量，**无需
 | `/auto on` | 开启自动选择 |
 | `/auto off` | 关闭自动选择，并取消正在进行的选档 |
 | `/auto status` | 查看后端、effort 和最近一次选档详情 |
+| `/auto default on` | 设置重启或重载后默认开启 |
+| `/auto default off` | 设置重启或重载后默认关闭 |
 
-开关只作用于当前扩展实例，重启或重载后默认开启。要固定 effort，先执行 `/auto off`，再用 `/thinking` 设置档位。关闭自动选择**不等于**将 effort 设为 `off`。
+`/auto`、`/auto on` 和 `/auto off` 只作用于当前扩展实例。`/auto default on|off` 保存全局启动默认值，不改变当前状态，重启或重载后生效。若要立即关闭并在以后默认关闭，依次执行 `/auto off` 和 `/auto default off`。
+
+默认值保存在 `<agent-dir>/pi-auto.json`，通常为 `~/.pi/agent/pi-auto.json`，遵循 `PI_CODING_AGENT_DIR`。文件不存在时默认开启；配置无效或无法读取时关闭自动选择并警告；保存失败不改变当前状态。不修改 Pi 自身的 `settings.json`。
+
+要固定 effort，先执行 `/auto off`，再用 `/thinking` 设置档位。关闭自动选择**不等于**将 effort 设为 `off`。
 
 ### 查看选档结果
 

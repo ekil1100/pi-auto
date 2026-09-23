@@ -12,7 +12,7 @@ Requires Node.js **22.19.0 or later** and Pi.
 pi install npm:pi-auto
 ```
 
-Choose your model with `/model`; no scoped-model configuration is needed. The extension is enabled by default, and the footer shows the current effort, such as `auto · low`.
+Choose your model with `/model`; no scoped-model configuration is needed. The extension starts enabled unless you save a different startup default, and the footer shows the current effort, such as `auto · low`.
 
 By default, your current model also selects the effort. You can optionally use Jev as the selector instead.
 
@@ -48,8 +48,14 @@ Restart Pi after changing proxy variables in its launch terminal.
 | `/auto on` | Enable automatic selection |
 | `/auto off` | Disable automatic selection and cancel a pending selection |
 | `/auto status` | Inspect the backend, effort, and latest selection |
+| `/auto default on` | Enable automatic selection by default after restart or reload |
+| `/auto default off` | Disable automatic selection by default after restart or reload |
 
-The toggle applies to the current extension instance; restarting or reloading enables it again. To use a fixed effort, run `/auto off`, then choose a level with `/thinking`. Disabling automatic selection does **not** set effort to `off`.
+`/auto`, `/auto on`, and `/auto off` affect only the current extension instance. `/auto default on|off` saves a global startup default without changing the current state; restarting or reloading applies it. To disable selection now and on future starts, run `/auto off` and `/auto default off`.
+
+The default is saved in `<agent-dir>/pi-auto.json` (normally `~/.pi/agent/pi-auto.json`; respects `PI_CODING_AGENT_DIR`). Without this file, selection starts enabled. Invalid or unreadable settings disable selection with a warning; a failed save leaves the current state unchanged. Pi's own `settings.json` is not modified.
+
+To use a fixed effort, run `/auto off`, then choose a level with `/thinking`. Disabling automatic selection does **not** set effort to `off`.
 
 ### Inspect a selection
 

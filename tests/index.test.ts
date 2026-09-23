@@ -24,16 +24,20 @@ vi.mock("../src/jev.ts", async (importOriginal) => {
 
 const jevDecision: JevDecision = { effort: "high", model: JEV_MODEL, confidence: 0.85, probabilities: { off: 0, minimal: 0, low: 0, medium: 0.15, high: 0.85 } };
 
-beforeEach(() => {
+let agentDirectory: string;
+beforeEach(async () => {
+	agentDirectory = await mkdtemp(join(tmpdir(), "pi-auto-settings-"));
+	vi.stubEnv("PI_CODING_AGENT_DIR", agentDirectory);
 	vi.spyOn(SettingsManager, "create").mockReturnValue(SettingsManager.inMemory({ defaultThinkingLevel: "medium" }));
 	vi.stubEnv("TYPESAFE_API_KEY", undefined);
 	vi.stubEnv("PI_AUTO_DEBUG", undefined);
 	vi.mocked(selectWithJev).mockReset().mockResolvedValue(jevDecision);
 });
 
-afterEach(() => {
+afterEach(async () => {
 	vi.unstubAllEnvs();
 	vi.restoreAllMocks();
+	await rm(agentDirectory, { recursive: true, force: true });
 });
 
 function createModel(id = "current", overrides: Partial<Model<Api>> = {}): Model<Api> {
@@ -150,6 +154,68 @@ function createHarness(
 		},
 	};
 }
+
+describe("startup defaults", () => {
+	it("persists off across instances without changing the current instance", async () => {
+		const current = createHarness(createModel());
+		await current.command("default off");
+		expect(JSON.parse(await readFile(join(agentDirectory, "pi-auto.json"), "utf8"))).toEqual({ defaultEnabled: false });
+		await current.start("Current instance stays enabled");
+		expect(current.complete).toHaveBeenCalledTimes(1);
+		const restarted = createHarness(createModel());
+		await restarted.emit({ type: "session_start", reason: "startup" });
+		await restarted.start("Disabled after restart");
+		expect(restarted.complete).not.toHaveBeenCalled();
+		await restarted.command("on");
+		await restarted.start("Temporary override");
+		expect(restarted.complete).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(await readFile(join(agentDirectory, "pi-auto.json"), "utf8"))).toEqual({ defaultEnabled: false });
+	});
+
+	it("persists on without enabling the current disabled instance", async () => {
+		await writeFile(join(agentDirectory, "pi-auto.json"), '{"defaultEnabled":false}');
+		const current = createHarness(createModel());
+		await current.command(" DEFAULT   ON ");
+		await current.start("Still disabled");
+		expect(current.complete).not.toHaveBeenCalled();
+		const restarted = createHarness(createModel());
+		await restarted.start("Enabled after reload");
+		expect(restarted.complete).toHaveBeenCalledTimes(1);
+		await restarted.command("off");
+		expect(JSON.parse(await readFile(join(agentDirectory, "pi-auto.json"), "utf8"))).toEqual({ defaultEnabled: true });
+	});
+
+	it.each(["default", "default maybe", "default off extra"])("rejects invalid command %s without writing settings", async (command) => {
+		const harness = createHarness(createModel());
+		await harness.command(command);
+		expect(harness.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Usage:"), "warning");
+		await expect(readFile(join(agentDirectory, "pi-auto.json"))).rejects.toMatchObject({ code: "ENOENT" });
+		await harness.start("Still enabled");
+		expect(harness.complete).toHaveBeenCalledTimes(1);
+	});
+
+	it.each(["not JSON", "{}", '{"defaultEnabled":"false"}'])("disables selection and warns for invalid settings %s", async (settings) => {
+		await writeFile(join(agentDirectory, "pi-auto.json"), settings);
+		const harness = createHarness(createModel());
+		await harness.emit({ type: "session_start", reason: "startup" });
+		expect(harness.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Could not load"), "warning");
+		await harness.start("Do not select");
+		expect(harness.complete).not.toHaveBeenCalled();
+		await harness.command("default on");
+		const restarted = createHarness(createModel());
+		await restarted.start("Recovered");
+		expect(restarted.complete).toHaveBeenCalledTimes(1);
+	});
+
+	it("reports save failures without changing the current state", async () => {
+		const harness = createHarness(createModel());
+		await mkdir(join(agentDirectory, "pi-auto.json"));
+		await harness.command("default off");
+		expect(harness.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Could not save"), "error");
+		await harness.start("Still enabled");
+		expect(harness.complete).toHaveBeenCalledTimes(1);
+	});
+});
 
 function requestPayload(harness: ReturnType<typeof createHarness>) {
 	const content = harness.complete.mock.calls[0]?.[1].messages[0]?.content;

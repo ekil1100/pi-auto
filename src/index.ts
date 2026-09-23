@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import {
 	getSupportedThinkingLevels,
 	clampThinkingLevel,
@@ -9,13 +10,14 @@ import {
 	type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
 import { matchesKey } from "@earendil-works/pi-tui";
-import { SettingsManager, type BeforeAgentStartEvent, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, SettingsManager, type BeforeAgentStartEvent, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { planEffort, ROUTER_RESPONSE_TEXT_LIMIT, type RouterResponseDiagnostics, type CompleteRouter, type RouterInvocation, type RoutingDiagnostics } from "./router.ts";
 import { JEV_MODEL, selectWithJev, type SelectJev, type JevTiming } from "./jev.ts";
 import { collectHistory, hasContextImages } from "./session-context.ts";
 import { createSelectingWidget, DECISION_ENTRY_TYPE, formatAutoEffort, readDecision, renderDecisionEntry, type EffortDecision } from "./selection-ui.ts";
 import { showAutoStatus } from "./status-ui.ts";
 import { createJevTransport } from "./jev-transport.ts";
+import { readDefaultEnabled, writeDefaultEnabled } from "./settings.ts";
 
 const ROUTER_TIMEOUT_MS = 10_000;
 const ROUTER_MAX_OUTPUT_TOKENS = 2_048;
@@ -24,7 +26,11 @@ const PROGRESS_KEY = "pi-auto-selecting";
 
 export default function piAuto(pi: ExtensionAPI): void {
 	const jevTransport = createJevTransport();
-	let enabled = true;
+	const settingsPath = join(getAgentDir(), "pi-auto.json");
+	let enabled: boolean;
+	let settingsLoadFailed = false;
+	try { enabled = readDefaultEnabled(settingsPath); }
+	catch { enabled = false; settingsLoadFailed = true; }
 	let lastDecision: EffortDecision | undefined;
 	let activeSelection: AbortController | undefined;
 	let stopped = false;
@@ -36,9 +42,19 @@ export default function piAuto(pi: ExtensionAPI): void {
 
 	pi.registerEntryRenderer(DECISION_ENTRY_TYPE, renderDecisionEntry);
 	pi.registerCommand("auto", {
-		description: "Toggle automatic effort selection (toggle, on, off, status)",
+		description: "Control automatic effort selection (toggle, on, off, status, default on/off)",
 		handler: async (args, ctx) => {
-			const action = args.trim().toLowerCase() || "toggle";
+			const action = args.trim().toLowerCase().replace(/\s+/g, " ") || "toggle";
+			if (action === "default on" || action === "default off") {
+				try {
+					writeDefaultEnabled(settingsPath, action === "default on");
+					settingsLoadFailed = false;
+					ctx.ui.notify(`pi-auto startup default: ${action === "default on" ? "on" : "off"}. Applies after restart or reload; current state unchanged.`, "info");
+				} catch {
+					ctx.ui.notify("Could not save pi-auto startup default; current state unchanged.", "error");
+				}
+				return;
+			}
 			if (action === "toggle" || action === "on" || action === "off") {
 				enabled = action === "toggle" ? !enabled : action === "on";
 				if (!enabled) activeSelection?.abort();
@@ -57,7 +73,7 @@ export default function piAuto(pi: ExtensionAPI): void {
 				});
 				return;
 			}
-			ctx.ui.notify("Usage: /auto [toggle|on|off|status]", "warning");
+			ctx.ui.notify("Usage: /auto [toggle|on|off|status|default on|default off]", "warning");
 		},
 	});
 
@@ -70,7 +86,10 @@ export default function piAuto(pi: ExtensionAPI): void {
 		}
 		updateFooter(ctx, enabled);
 	};
-	pi.on("session_start", (_event, ctx) => restore(ctx));
+	pi.on("session_start", (_event, ctx) => {
+		if (settingsLoadFailed) ctx.ui.notify("Could not load pi-auto startup default; automatic selection is disabled. Use /auto on for this instance or /auto default on|off to save a new default.", "warning");
+		restore(ctx);
+	});
 	pi.on("session_tree", (_event, ctx) => restore(ctx));
 	pi.on("model_select", (_event, ctx) => { invalidateSelection(); updateFooter(ctx, enabled); });
 	pi.on("thinking_level_select", (event, ctx) => { invalidateSelection(); updateFooter(ctx, enabled, event.level); });
