@@ -24,7 +24,7 @@ const section = (title: string): StatusLine[] => [row(""), row(title, "accent")]
 /** All views consume the same snapshot; inspecting it never re-runs selection. */
 export function buildStatusPages(state: AutoStatus): StatusPage[] {
 	const last = state.last;
-	const context = last?.routing?.compaction;
+	const context = last?.routing?.context;
 	const overview = [
 		row("Current (at open)", "accent"),
 		row(`Auto: ${state.enabled ? "enabled" : "disabled"} (effort only)`),
@@ -47,32 +47,15 @@ export function buildStatusPages(state: AutoStatus): StatusPage[] {
 	const contextLines: StatusLine[] = [];
 	if (!context) contextLines.push(row("No context diagnostics recorded.", "dim"));
 	else {
-		const packed = context.status === "bypassed" || context.status === "extracted";
-		contextLines.push(row(`Context: ${context.status}`, "accent"), row(formatContextSummary(context)),
-			row(`Candidate pool incomplete: ${context.candidatesTruncated ? "yes" : "no"}`, context.candidatesTruncated ? "warning" : undefined),
-			row(`Candidate JSON: ${context.candidateCharacters} UTF-16 units`),
-			row(`Packed history: ${context.selectedCharacters} UTF-16 units`));
-		if (context.reason) contextLines.push(row(`Failure: ${context.reason}`, "warning"));
-		contextLines.push(row("Ranges are [start, end) in newline-joined message text.", "dim"),
-			row("Importance is a rating, not a guarantee of retention.", "dim"),
+		contextLines.push(row(`Context: ${context.strategy}`, "accent"), row(formatContextSummary(context)),
+			row(`History: ${context.characters} UTF-16 units`), row(`Local elapsed: ${context.elapsedMs}ms`),
+			row("Ranges are [start, end) in newline-joined message text.", "dim"),
 			row("Source metadata only; message text is not displayed.", "dim"));
-		if (context.candidateSources) {
-			const ratings = new Map(context.ratings.map(({ id, importance }) => [id, importance]));
-			contextLines.push(...section("Candidates (source order)"));
-			if (!context.candidateSources.length) contextLines.push(row("No candidate metadata available.", "dim"));
-			for (const [index, candidate] of context.candidateSources.entries()) {
-				const retained = context.sources.some((source) => source.entryId === candidate.entryId && source.role === candidate.role &&
-					source.start === candidate.start && source.end === candidate.end);
-				const importance = ratings.get(candidate.id) ?? (context.status === "bypassed" ? "not classified" : "not recorded");
-				contextLines.push(row(`${index + 1}. ${candidate.role} | ${importance} | ${packed ? (retained ? "retained" : "not retained") : "not packed"}`),
-					row(`   Source: ${candidate.entryId}`),
-					row(`   Range: ${candidate.start}-${candidate.end} | Candidate: ${candidate.id}`), row(""));
-			}
-		} else {
-			// Old entries did not record candidate-to-source links. Do not infer them from IDs.
-			contextLines.push(...section("Saved sources and ratings"), row("Candidate/source mapping was not recorded.", "dim"));
-			for (const source of context.sources) contextLines.push(row(`Retained: ${source.role} | ${source.entryId} | ${source.start}-${source.end}`));
-			for (const rating of context.ratings) contextLines.push(row(`Candidate ${rating.id}: ${rating.importance} | retention unknown`));
+		contextLines.push(...section("Sources (conversation order)"));
+		if (!context.sources.length) contextLines.push(row("No messages retained.", "dim"));
+		for (const [index, source] of context.sources.entries()) {
+			contextLines.push(row(`${index + 1}. ${source.role}`), row(`   Source: ${source.entryId}`),
+				row(`   Range: ${source.start}-${source.end}`), row(""));
 		}
 	}
 
@@ -91,35 +74,28 @@ export function buildStatusPages(state: AutoStatus): StatusPage[] {
 		}
 		diagnostics.push(...section("Timing"), row(`Total: ${last.elapsedMs}ms`));
 		if (last.prepareMs !== undefined) diagnostics.push(row(`Prepare: ${last.prepareMs.toFixed(1)}ms`));
-		if (context?.elapsedMs !== undefined) diagnostics.push(row(`Context stage: ${context.elapsedMs}ms`));
+		if (context?.elapsedMs !== undefined) diagnostics.push(row(`Local context: ${context.elapsedMs}ms`));
 		if (last.routing?.selectionMs !== undefined) diagnostics.push(row(`Selection: ${last.routing.selectionMs}ms`));
-		for (const [label, timing] of [["Context request", last.contextTiming], ["Effort request", last.jevTiming]] as const) {
-			if (!timing) continue;
-			diagnostics.push(...section(label), ...formatJevTiming(timing).split(" · ").filter(Boolean).map((text) => row(text)));
+		const timing = last.jevTiming;
+		if (timing) {
+			diagnostics.push(...section("Effort request"), ...formatJevTiming(timing).split(" · ").filter(Boolean).map((text) => row(text)));
 			if (timing.requestBytes !== undefined) diagnostics.push(row(`Request bytes: ${timing.requestBytes}`));
 			if (timing.httpStatus !== undefined) diagnostics.push(row(`HTTP status: ${timing.httpStatus}`));
 			if (timing.transport) diagnostics.push(row(`Observed requests: ${timing.transport.requestCount}`));
 		}
 		diagnostics.push(...section("Usage"), row("Extra selector calls are not included in Pi footer totals.", "dim"));
 		let hasUsage = false;
-		for (const [label, timing] of [["Context", last.contextTiming], ["Effort", last.jevTiming]] as const) {
-			if (timing?.inputTokens === undefined && timing?.outputTokens === undefined) continue;
+		if (timing?.inputTokens !== undefined || timing?.outputTokens !== undefined) {
 			hasUsage = true;
-			diagnostics.push(row(`${label} usage: ${timing.inputTokens ?? "unknown"} input / ${timing.outputTokens ?? "unknown"} output tokens`));
+			diagnostics.push(row(`Effort usage: ${timing.inputTokens ?? "unknown"} input / ${timing.outputTokens ?? "unknown"} output tokens`));
 		}
-		for (const [purpose, usage] of Object.entries(last.selectorUsage ?? {})) {
+		const usage = last.selectorUsage?.effort;
+		if (usage) {
 			hasUsage = true;
-			diagnostics.push(row(`${purpose}: ${usage.input} input / ${usage.output} output tokens`),
+			diagnostics.push(row(`effort: ${usage.input} input / ${usage.output} output tokens`),
 				row(`Cache: ${usage.cacheRead} read / ${usage.cacheWrite} write | Cost: $${usage.cost}`));
 		}
 		if (!hasUsage) diagnostics.push(row("Usage not recorded.", "dim"));
-		if (last.contextDecisions?.length) {
-			diagnostics.push(...section("Context classification probabilities"), row("Confidence is not classification accuracy.", "dim"));
-			for (const decision of last.contextDecisions) {
-				diagnostics.push(row(`${decision.id}: ${decision.importance} | confidence ${decision.confidence}`));
-				for (const [importance, probability] of Object.entries(decision.probabilities)) diagnostics.push(row(`  ${importance}: ${probability}`));
-			}
-		}
 	}
 	return [{ title: "Overview", lines: overview }, { title: "Context", lines: contextLines }, { title: "Diagnostics", lines: diagnostics }];
 }

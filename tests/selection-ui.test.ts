@@ -159,14 +159,12 @@ describe("selection UI", () => {
 		expect(text).not.toContain("body/decode");
 	});
 
-	it("round trips and displays both stages' socket evidence without fabricating reused dial times", () => {
+	it("round trips effort socket evidence without fabricating reused dial times", () => {
 		const data: Partial<EffortDecision> = {
-			contextTiming: { transport: { status: "observed", requestCount: 1, connection: "new", socketId: 7, connectMs: 400.1, afterUploadMs: 1700.2 } },
 			jevTiming: { transport: { status: "observed", requestCount: 1, connection: "reused", socketId: 7, afterUploadMs: 270.3 } },
 		};
 		expect(readDecision(JSON.parse(JSON.stringify(entry(data))))).toMatchObject(data);
 		const text = diagnostics(data);
-		expect(text).toContain("Context request\ntransport observed\nconnection new\nsocket #7\nconnect 400.1ms\nafter-upload 1700.2ms");
 		expect(text).toContain("Effort request\ntransport observed\nconnection reused\nsocket #7\nafter-upload 270.3ms");
 		expect(text).not.toContain("connect 0.0ms");
 	});
@@ -210,45 +208,41 @@ describe("selection UI", () => {
 	});
 });
 
-function twoStageDecision(): Partial<EffortDecision> {
+function recentTurnDecision(): Partial<EffortDecision> {
 	return {
 		effort: "max", routerModel: "typesafe/jev-1.13.0", routerEffort: undefined, routerConfidence: 0.9,
 		prepareMs: 1, elapsedMs: 61,
-		contextTiming: { setupMs: 1, headersMs: 10, bodyAndDecodeMs: 1, validateMs: 0.5, totalMs: 12.5, inputTokens: 700, outputTokens: 3 },
 		jevTiming: { setupMs: 1, headersMs: 40, bodyAndDecodeMs: 4, validateMs: 0.5, totalMs: 45.5, inputTokens: 300, outputTokens: 1 },
 		routerProbabilities: { low: 0.01, medium: 0.04, high: 0.05, max: 0.9 },
 		routing: {
 			policyVersion: "1", supportedEfforts: ["low", "medium", "high", "max"], taskTruncated: true, selectionMs: 45.5,
-			compaction: { status: "extracted", candidateCount: 3, candidateCharacters: 8_000, candidatesTruncated: true,
-				selectedCount: 1, selectedCharacters: 2_600, elapsedMs: 12.5,
+			context: { strategy: "recent-turn", omitted: true, characters: 2_600, elapsedMs: 0.5,
 				sources: [{ entryId: "history-entry", role: "user", start: 12, end: 2_512 }],
-				ratings: [{ id: "c0:0:2500", importance: "irrelevant" }, { id: "c1:12:2512", importance: "required" }, { id: "c2:0:2500", importance: "background" }],
 			},
 		},
 	};
 }
 
-describe("two-stage decision records", () => {
-	it("round trips all new diagnostics including source ranges, ratings and full probabilities", () => {
-		const original = entry(twoStageDecision());
+describe("recent-turn decision records", () => {
+	it("round trips all new diagnostics including source ranges and effort probabilities", () => {
+		const original = entry(recentTurnDecision());
 		const restored = readDecision(JSON.parse(JSON.stringify(original)));
 		expect(restored).toEqual(original.data);
-		expect(restored?.routing?.compaction?.sources).toEqual([{ entryId: "history-entry", role: "user", start: 12, end: 2_512 }]);
-		expect(restored?.routing?.compaction?.ratings).toHaveLength(3);
+		expect(restored?.routing?.context?.sources).toEqual([{ entryId: "history-entry", role: "user", start: 12, end: 2_512 }]);
 	});
 
 	it("moves detailed accounting to diagnostics and keeps transcript expansion brief", () => {
-		const data = twoStageDecision();
+		const data = recentTurnDecision();
 		const text = diagnostics(data);
 		for (const detail of [
 			"Policy: 1", "Selector choices: low, medium, high, max", "Task truncated: true",
-			"Context request", "Effort request", "total 45.5ms", "total 12.5ms",
-			"Context usage: 700 input / 3 output tokens", "Effort usage: 300 input / 1 output tokens",
+			"Local context: 0.5ms", "Effort request", "total 45.5ms",
+			"Effort usage: 300 input / 1 output tokens",
 			"low: 0.01", "max: 0.9",
 		]) expect(text).toContain(detail);
 		const expanded = render(true, data, 200).lines;
 		expect(expanded.length).toBeLessThanOrEqual(8);
-		expect(expanded.join("\n")).toContain("1 of 3 blocks retained · omitted: yes");
+		expect(expanded.join("\n")).toContain("1 messages retained · omitted: yes");
 		expect(expanded.join("\n")).not.toMatch(/Policy:|timing:|Probabilities:|usage:/);
 		const collapsed = render(false, data).lines;
 		expect(collapsed).toHaveLength(1);
@@ -257,43 +251,63 @@ describe("two-stage decision records", () => {
 	});
 
 	it("shows final model selection time separately from context time", () => {
-		const { routing } = twoStageDecision();
+		const { routing } = recentTurnDecision();
 		const text = diagnostics({ routing: routing!, routerModel: "test/current", routerEffort: "low" });
-		expect(text).toContain("12.5ms");
+		expect(text).toContain("Local context: 0.5ms");
 		expect(text).toContain("45.5ms");
 	});
 
-	it("round trips and renders usage for both current-model requests", () => {
+	it("round trips and renders usage for the current-model effort request", () => {
 		const selectorUsage = {
-			context: { input: 700, output: 25, cacheRead: 10, cacheWrite: 0, cost: 0.01 },
 			effort: { input: 300, output: 12, cacheRead: 0, cacheWrite: 5, cost: 0.02 },
 		};
 		expect(readDecision(JSON.parse(JSON.stringify(entry({ selectorUsage }))))?.selectorUsage).toEqual(selectorUsage);
 		const text = diagnostics({ selectorUsage });
-		expect(text).toContain("context: 700 input / 25 output tokens");
 		expect(text).toContain("effort: 300 input / 12 output tokens");
-		expect(text).toContain("Cache: 10 read / 0 write | Cost: $0.01");
 		expect(text).toContain("Cache: 0 read / 5 write | Cost: $0.02");
 	});
 
 	it("accepts legacy records without inventing new diagnostics or usage", () => {
 		const restored = readDecision(JSON.parse(JSON.stringify(entry())))!;
-		for (const field of ["routing", "contextTiming", "jevTiming", "routerProbabilities", "selectorUsage"]) expect(restored).not.toHaveProperty(field);
+		for (const field of ["routing", "jevTiming", "routerProbabilities", "selectorUsage"]) expect(restored).not.toHaveProperty(field);
 		expect(render(true, restored).lines.join("\n")).not.toMatch(/Policy:|Context:|timing:|Probabilities:|usage:/);
 	});
 
 	it.each([
-		{ contextTiming: { inputTokens: "700" } },
-		{ contextTiming: { outputTokens: -1 } },
-		{ contextTiming: { requestBody: "private" } },
 		{ routerProbabilities: { high: NaN } },
-		{ selectorUsage: { context: { input: "700", output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 } } },
+		{ selectorUsage: { context: { input: 700, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 } } },
+		{ selectorResponses: { context: { stopReason: "stop", contentTypes: ["text"], textCharacters: 0 } } },
 		{ selectorUsage: { effort: { input: 700, output: 1, cacheRead: 0, cacheWrite: 0, cost: Infinity } } },
-		{ routing: { ...twoStageDecision().routing, taskTruncated: "true" } },
-		{ routing: { ...twoStageDecision().routing, selectionMs: -1 } },
-		{ routing: { ...twoStageDecision().routing, compaction: { ...twoStageDecision().routing!.compaction, ratings: [{ id: "c0", importance: "invalid" }] } } },
-		{ routing: { ...twoStageDecision().routing, compaction: { ...twoStageDecision().routing!.compaction, sources: [{ entryId: "entry", role: "user", start: 10, end: 5 }] } } },
-	])("rejects malformed two-stage saved metadata: %j", (overrides) => {
+		{ routing: { ...recentTurnDecision().routing, taskTruncated: "true" } },
+		{ routing: { ...recentTurnDecision().routing, selectionMs: -1 } },
+	])("rejects malformed saved metadata: %j", (overrides) => {
 		expect(readDecision({ ...entry(), data: { ...entry().data, ...overrides } })).toBeUndefined();
+	});
+
+	it.each([
+		null, [], {},
+		{ strategy: "classification" }, { omitted: "false" }, { omitted: undefined },
+		{ characters: -1 }, { characters: 0.5 }, { characters: Infinity },
+		{ elapsedMs: undefined }, { elapsedMs: -1 }, { elapsedMs: NaN },
+		{ sources: undefined }, { sources: Array(3).fill({ entryId: "entry", role: "user", start: 0, end: 5 }) },
+		{ sources: [{ entryId: "entry", role: "summary", start: 0, end: 5 }] },
+		{ sources: [{ entryId: "entry", role: "user", start: 10, end: 5 }] },
+		{ sources: [{ entryId: "entry", role: "user", start: 0.5, end: 5 }] },
+		{ text: "private" },
+	])("rejects invalid recent-turn context metadata: %j", (overrides) => {
+		const saved = entry(recentTurnDecision());
+		const context = overrides === null || Array.isArray(overrides) || Object.keys(overrides).length === 0
+			? overrides : { ...saved.data!.routing!.context, ...overrides };
+		Object.assign(saved.data!.routing!, { context });
+		expect(readDecision(saved)).toBeUndefined();
+	});
+
+	it("round trips effort response diagnostics without exposing raw text in the UI", () => {
+		const selectorResponses = { effort: { stopReason: "stop" as const, contentTypes: ["text" as const],
+			textCharacters: 7, rawText: "private", rawTextTruncated: false } };
+		const restored = readDecision(JSON.parse(JSON.stringify(entry({ selectorResponses }))))!;
+		expect(restored.selectorResponses).toEqual(selectorResponses);
+		expect(render(true, restored).lines.join("\n")).not.toContain("private");
+		expect(diagnostics(restored)).not.toContain("private");
 	});
 });

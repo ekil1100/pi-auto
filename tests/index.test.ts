@@ -14,12 +14,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import piAuto from "../src/index.ts";
-import { JEV_MODEL, selectWithJev, classifyWithJev, type JevDecision, type JevTiming } from "../src/jev.ts";
+import { JEV_MODEL, selectWithJev, type JevDecision, type JevTiming } from "../src/jev.ts";
 import { DECISION_ENTRY_TYPE, readDecision } from "../src/selection-ui.ts";
 
 vi.mock("../src/jev.ts", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../src/jev.ts")>();
-	return { ...actual, selectWithJev: vi.fn(), classifyWithJev: vi.fn() };
+	return { ...actual, selectWithJev: vi.fn() };
 });
 
 const jevDecision: JevDecision = { effort: "high", model: JEV_MODEL, confidence: 0.85, probabilities: { off: 0, minimal: 0, low: 0, medium: 0.15, high: 0.85 } };
@@ -29,7 +29,6 @@ beforeEach(() => {
 	vi.stubEnv("TYPESAFE_API_KEY", undefined);
 	vi.stubEnv("PI_AUTO_DEBUG", undefined);
 	vi.mocked(selectWithJev).mockReset().mockResolvedValue(jevDecision);
-	vi.mocked(classifyWithJev).mockReset().mockImplementation(async (_key, { candidates }) => candidates.map(({ id }) => ({ id, importance: "useful" })));
 });
 
 afterEach(() => {
@@ -158,6 +157,9 @@ function requestPayload(harness: ReturnType<typeof createHarness>) {
 	return JSON.parse(content[0].text) as {
 		task: string;
 		taskCharacters: number;
+		taskTruncated: boolean;
+		recentConversation?: string;
+		contextOmitted: boolean;
 		hasImages: boolean;
 		model: { id: string };
 		supportedEfforts: string[];
@@ -205,7 +207,7 @@ describe("Jev lifecycle", () => {
 			supportedEfforts: ["off", "minimal", "low", "medium", "high"],
 		});
 		expect(invocation.state.recentConversation).toContain("Earlier task");
-		expect(invocation.state.task).toHaveLength(12_000);
+		expect(invocation.state.task).toBe(`start-${"x".repeat(20_000)}-end`);
 		expect(invocation.state.task).toMatch(/^start-/);
 		expect(invocation.state.task).toMatch(/-end$/);
 		expect(JSON.stringify(invocation.state)).not.toContain(image.data);
@@ -318,6 +320,8 @@ describe("Jev lifecycle", () => {
 			expect(harness.pi.setThinkingLevel).toHaveBeenCalledExactlyOnceWith("high");
 			expect(harness.complete).toHaveBeenCalledTimes(1);
 			expect(timeout).toHaveBeenCalledTimes(2);
+			expect(timeout).toHaveBeenNthCalledWith(1, 10_000);
+			expect(timeout).toHaveBeenNthCalledWith(2, 10_000);
 			expect(harness.complete.mock.calls[0]?.[2]?.signal).not.toBe(vi.mocked(selectWithJev).mock.calls[0]?.[1].signal);
 			expect(decisions(harness)).toEqual([expect.objectContaining({ status: "selected", reason: "Jev failed (router timed out); current-model fallback: Best fit" })]);
 			expect(decisions(harness)[0]?.routerConfidence).toBeUndefined();
@@ -730,7 +734,7 @@ describe("pi-auto lifecycle", () => {
 		expect(harness.complete.mock.calls[0]?.[2]?.maxTokens).toBe(budget);
 	});
 
-	it("clips long tasks instead of switching to a larger model", async () => {
+	it("preserves long tasks without switching to a larger model", async () => {
 		const current = createModel("small", { contextWindow: 10_000 });
 		const harness = createHarness(current, [{ model: createModel("large") }]);
 
@@ -738,7 +742,7 @@ describe("pi-auto lifecycle", () => {
 
 		expect(harness.ctx.model).toBe(current);
 		expect(harness.pi.setModel).not.toHaveBeenCalled();
-		expect(requestPayload(harness).task.length).toBe(12_000);
+		expect(requestPayload(harness).task).toBe("x".repeat(32_000));
 		expect(requestPayload(harness).taskCharacters).toBe(32_000);
 	});
 
@@ -754,28 +758,155 @@ describe("pi-auto lifecycle", () => {
 		expect(harness.pi.setModel).not.toHaveBeenCalled();
 	});
 
-	it.each(["model", "jev"] as const)("selects with %s after an image-only turn even when an older task exceeds the candidate budget", async (backend) => {
+	it.each(["model", "jev", "fallback"] as const)("sends only the prior user and final text reply to %s while keeping current input as task", async (backend) => {
+		if (backend !== "model") vi.stubEnv("TYPESAFE_API_KEY", "test-typesafe-key");
+		if (backend === "fallback") vi.mocked(selectWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+		const model = createModel();
+		const harness = createHarness(model);
+		const session = harness.ctx.sessionManager;
+		const oldUserId = session.appendMessage({ role: "user", content: "Obsolete user task", timestamp: Date.now() });
+		session.appendMessage(routerResponse(model, { content: [{ type: "text", text: "Obsolete assistant reply" }] }));
+		session.appendCompaction("Private summary of earlier work", oldUserId, 90_000);
+		const user = "Investigate the connection failure";
+		const userId = session.appendMessage({ role: "user", content: user, timestamp: Date.now() });
+		session.appendMessage(routerResponse(model, { content: [{ type: "text", text: "Intermediate progress" }] }));
+		session.appendMessage({ role: "toolResult", toolCallId: "read", toolName: "read", content: [{ type: "text", text: "Private tool output" }], isError: false, timestamp: Date.now() });
+		const reply = "The connection uses an outdated endpoint.\nUpdate the endpoint configuration.";
+		const assistantId = session.appendMessage(routerResponse(model, { content: [
+			{ type: "thinking", thinking: "Private reasoning" },
+			...reply.split("\n").map((text) => ({ type: "text" as const, text })),
+		] }));
+		session.appendMessage(routerResponse(model, { content: [{ type: "thinking", thinking: "Trailing private reasoning" }] }));
+		const before = session.buildSessionContext().messages;
+		const task = "Apply that fix and add a regression test";
+
+		await harness.start(task);
+
+		expect(harness.complete).toHaveBeenCalledTimes(backend === "jev" ? 0 : 1);
+		expect(selectWithJev).toHaveBeenCalledTimes(backend === "model" ? 0 : 1);
+		const payload = backend === "jev" ? vi.mocked(selectWithJev).mock.calls[0]![1].state : requestPayload(harness);
+		if (backend === "fallback") expect(vi.mocked(selectWithJev).mock.calls[0]![1].state).toEqual(payload);
+		expect(payload).toMatchObject({ task, taskCharacters: task.length, contextOmitted: true });
+		expect(payload).not.toHaveProperty("candidates");
+		expect(payload.recentConversation).toContain(user);
+		expect(payload.recentConversation).toContain(reply);
+		expect(payload.recentConversation!.indexOf(user)).toBeLessThan(payload.recentConversation!.indexOf(reply));
+		for (const excluded of [task, "Private summary of earlier work", "Obsolete user task", "Obsolete assistant reply", "Intermediate progress", "Private tool output", "Private reasoning", "Trailing private reasoning"]) {
+			expect(payload.recentConversation).not.toContain(excluded);
+		}
+		expect(decisions(harness)[0]).toMatchObject({ status: "selected", routing: { context: {
+			strategy: "recent-turn", omitted: true, characters: payload.recentConversation!.length, elapsedMs: expect.any(Number), sources: [
+				{ entryId: userId, role: "user", start: 0, end: user.length },
+				{ entryId: assistantId, role: "assistant", start: 0, end: reply.length },
+			],
+		} } });
+		expect(session.buildSessionContext().messages).toEqual(before);
+	});
+
+	it.each(["model", "jev", "fallback"] as const)("does not send a summary or an orphan assistant reply to %s", async (backend) => {
+		if (backend !== "model") vi.stubEnv("TYPESAFE_API_KEY", "test-typesafe-key");
+		if (backend === "fallback") vi.mocked(selectWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+		const model = createModel();
+		const harness = createHarness(model);
+		const session = harness.ctx.sessionManager;
+		session.appendMessage({ role: "user", content: "Compacted private task", timestamp: Date.now() });
+		const replyId = session.appendMessage(routerResponse(model, { content: [{ type: "text", text: "Orphan private reply" }] }));
+		session.appendCompaction("Private summary", replyId, 90_000);
+		const before = session.buildSessionContext().messages;
+
+		await harness.start("New task");
+
+		expect(harness.complete).toHaveBeenCalledTimes(backend === "jev" ? 0 : 1);
+		expect(selectWithJev).toHaveBeenCalledTimes(backend === "model" ? 0 : 1);
+		const payload = backend === "jev" ? vi.mocked(selectWithJev).mock.calls[0]![1].state : requestPayload(harness);
+		if (backend === "fallback") expect(vi.mocked(selectWithJev).mock.calls[0]![1].state).toEqual(payload);
+		expect(payload).toMatchObject({ task: "New task", contextOmitted: true });
+		expect(payload).not.toHaveProperty("recentConversation");
+		for (const secret of ["Compacted private task", "Orphan private reply", "Private summary"]) expect(JSON.stringify(payload)).not.toContain(secret);
+		expect(decisions(harness)[0]).toMatchObject({ status: "selected", routing: { context: {
+			strategy: "recent-turn", omitted: true, characters: 0, sources: [], elapsedMs: expect.any(Number),
+		} } });
+		expect(session.buildSessionContext().messages).toEqual(before);
+	});
+
+	it.each(["model", "jev", "fallback"] as const)("reports an untruncated single user as retained without omissions for %s", async (backend) => {
+		if (backend !== "model") vi.stubEnv("TYPESAFE_API_KEY", "test-typesafe-key");
+		if (backend === "fallback") vi.mocked(selectWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+		const harness = createHarness(createModel());
+		const user = "Investigate the failure";
+		const entryId = harness.ctx.sessionManager.appendMessage({ role: "user", content: user, timestamp: Date.now() });
+
+		await harness.start("Continue");
+		await harness.command("status");
+
+		expect(harness.complete).toHaveBeenCalledTimes(backend === "jev" ? 0 : 1);
+		expect(selectWithJev).toHaveBeenCalledTimes(backend === "model" ? 0 : 1);
+		const payload = backend === "jev" ? vi.mocked(selectWithJev).mock.calls[0]![1].state : requestPayload(harness);
+		if (backend === "fallback") expect(vi.mocked(selectWithJev).mock.calls[0]![1].state).toEqual(payload);
+		expect(payload).toMatchObject({ task: "Continue", contextOmitted: false });
+		expect(payload.recentConversation).toContain(user);
+		expect(payload.recentConversation).not.toContain("omitted");
+		expect(decisions(harness)[0]?.routing?.context).toEqual({ strategy: "recent-turn", omitted: false,
+			characters: payload.recentConversation!.length, elapsedMs: expect.any(Number),
+			sources: [{ entryId, role: "user", start: 0, end: user.length }] });
+		const status = harness.ctx.ui.notify.mock.lastCall?.[0];
+		expect(status).toContain("Context: recent-turn");
+		expect(status).toContain("1 messages retained · omitted: no");
+		expect(status).toContain(`Source: ${entryId}`);
+		expect(status).toContain("1. user");
+	});
+
+	it.each(["model", "jev", "fallback"] as const)("preserves long recent history for %s without a model classification call", async (backend) => {
+		if (backend !== "model") vi.stubEnv("TYPESAFE_API_KEY", "test-typesafe-key");
+		if (backend === "fallback") vi.mocked(selectWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+		const model = createModel();
+		const harness = createHarness(model);
+		const user = "Recent user request: ".padEnd(7_000, "u");
+		const reply = "Final assistant reply: ".padEnd(7_000, "a");
+		harness.ctx.sessionManager.appendMessage({ role: "user", content: user, timestamp: Date.now() });
+		harness.ctx.sessionManager.appendMessage(routerResponse(model, { content: [{ type: "text", text: reply }] }));
+
+		await harness.start("Continue with the next step");
+
+		expect(harness.complete).toHaveBeenCalledTimes(backend === "jev" ? 0 : 1);
+		expect(selectWithJev).toHaveBeenCalledTimes(backend === "model" ? 0 : 1);
+		const payload = backend === "jev" ? vi.mocked(selectWithJev).mock.calls[0]![1].state : requestPayload(harness);
+		if (backend === "fallback") expect(vi.mocked(selectWithJev).mock.calls[0]![1].state).toEqual(payload);
+		expect(payload).toMatchObject({ task: "Continue with the next step", contextOmitted: false });
+		expect(payload).not.toHaveProperty("candidates");
+		expect(payload.recentConversation).toContain(user);
+		expect(payload.recentConversation).toContain(reply);
+		const context = decisions(harness)[0]?.routing?.context;
+		expect(context).toMatchObject({ strategy: "recent-turn", omitted: false, characters: payload.recentConversation!.length, elapsedMs: expect.any(Number) });
+		expect(context!.sources).toHaveLength(2);
+		expect(decisions(harness)[0]?.status).toBe("selected");
+		expect(context!.sources.every(({ start, end }) => start === 0 && end === 7_000)).toBe(true);
+	});
+
+	it.each(["model", "jev"] as const)("selects with %s after an image-only turn even when an older task exceeds the context budget", async (backend) => {
 		if (backend === "jev") vi.stubEnv("TYPESAFE_API_KEY", "test-typesafe-key");
 		const model = createModel();
 		const harness = createHarness(model);
 		const session = harness.ctx.sessionManager;
 		session.appendMessage({ role: "user", content: "old-task ".repeat(3_000), timestamp: Date.now() });
-		session.appendMessage({ role: "user", content: [image], timestamp: Date.now() });
-		session.appendMessage(routerResponse(model, { content: [{ type: "text", text: "The screenshot shows a connection error." }] }));
+		const userId = session.appendMessage({ role: "user", content: [image], timestamp: Date.now() });
+		const reply = "The screenshot shows a connection error.";
+		const assistantId = session.appendMessage(routerResponse(model, { content: [{ type: "text", text: reply }] }));
 
 		await harness.start("Continue investigating the screenshot");
 
 		expect(decisions(harness)[0]).toMatchObject({ status: "selected", effort: "high", routing: {
-			compaction: { status: "bypassed", candidatesTruncated: true, candidateCount: 1, selectedCount: 1 },
+			context: { strategy: "recent-turn", omitted: true, sources: [
+				{ entryId: userId, role: "user", start: 0, end: 0 },
+				{ entryId: assistantId, role: "assistant", start: 0, end: reply.length },
+			] },
 		} });
 		expect(harness.complete).toHaveBeenCalledTimes(backend === "model" ? 1 : 0);
 		expect(selectWithJev).toHaveBeenCalledTimes(backend === "jev" ? 1 : 0);
-		expect(classifyWithJev).not.toHaveBeenCalled();
 		const state = backend === "jev" ? vi.mocked(selectWithJev).mock.calls[0]![1].state
 			: JSON.parse((harness.complete.mock.calls[0]![1].messages[0]!.content[0] as { text: string }).text);
 		expect(state.hasImages).toBe(true);
 		expect(state.recentConversation).toContain("The screenshot shows a connection error.");
-		expect(state.recentConversation).toContain("partialTurn=true");
 		expect(JSON.stringify(state)).not.toContain(image.data);
 		expect(JSON.stringify(state)).not.toContain("old-task");
 	});
@@ -1093,57 +1224,42 @@ describe("pi-auto lifecycle", () => {
 	});
 });
 
-type Backend = "model" | "jev";
-type Phase = "context" | "effort";
+type Backend = "model" | "jev" | "fallback";
+const lifecycleBackends = ["model", "jev", "fallback"] as const;
 
-function twoStageHarness(backend: Backend, pausedPhase?: Phase, model = createModel()) {
-	vi.stubEnv("TYPESAFE_API_KEY", backend === "jev" ? "test-typesafe-key" : undefined);
+function historyHarness(backend: Backend, paused = false, model = createModel()) {
+	vi.stubEnv("TYPESAFE_API_KEY", backend === "model" ? undefined : "test-typesafe-key");
 	const harness = createHarness(model);
 	const history = ["old-private-history", "active-private-history", "recent-private-history"].map((prefix) => prefix.padEnd(2_500, "x"));
 	const entryIds = history.map((content) => harness.ctx.sessionManager.appendMessage({ role: "user", content, timestamp: Date.now() }));
 	let release!: () => void;
 	const gate = new Promise<void>((resolve) => { release = resolve; });
-	const phases: Phase[] = [];
+	const attempts: ("model" | "jev")[] = [];
 	const signals: (AbortSignal | undefined)[] = [];
-	const wait = async (phase: Phase, signal?: AbortSignal) => {
-		phases.push(phase);
+	const wait = async (selector: "model" | "jev", signal?: AbortSignal) => {
+		attempts.push(selector);
 		signals.push(signal);
-		if (phase === pausedPhase) await gate; // Deliberately ignore abort to simulate a late backend.
+		if (paused) await gate; // Deliberately ignore abort to simulate a late backend.
 	};
-	const ratings = (candidates: readonly { id: string }[]) => candidates.map(({ id }, index) => ({
-		id, importance: index === 1 ? "required" as const : "irrelevant" as const,
-	}));
-	harness.complete.mockImplementation(async (current, context, options) => {
-		const content = context.messages[0]!.content;
-		if (!Array.isArray(content) || content[0]?.type !== "text") throw new Error("Missing request");
-		const state = JSON.parse(content[0].text);
-		const phase = state.candidates ? "context" : "effort";
-		await wait(phase, options?.signal);
+	harness.complete.mockImplementation(async (current, _context, options) => {
+		await wait("model", options?.signal);
 		return routerResponse(current, {
-			content: [{ type: "text", text: state.candidates ? JSON.stringify(ratings(state.candidates)) : '{"effort":"high"}' }],
+			content: [{ type: "text", text: '{"effort":"high"}' }],
 			usage: { input: 120, output: 15, cacheRead: 3, cacheWrite: 2, totalTokens: 140,
 				cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 } },
 		});
 	});
-	vi.mocked(classifyWithJev).mockImplementation(async (_key, invocation) => {
-		invocation.onTiming?.({ setupMs: 1 });
-		await wait("context", invocation.signal);
-		invocation.onTiming?.({ setupMs: 1, totalMs: 15, inputTokens: 120, outputTokens: 3 });
-		invocation.onDecisions?.(ratings(invocation.candidates).map((rating) => ({ ...rating, confidence: 1,
-			probabilities: { required: rating.importance === "required" ? 1 : 0, useful: 0, background: 0, irrelevant: rating.importance === "irrelevant" ? 1 : 0 },
-		})));
-		return ratings(invocation.candidates);
-	});
 	vi.mocked(selectWithJev).mockImplementation(async (_key, invocation) => {
 		invocation.onTiming?.({ setupMs: 2 });
-		await wait("effort", invocation.signal);
+		if (backend === "fallback") throw new Error("Jev request failed");
+		await wait("jev", invocation.signal);
 		invocation.onTiming?.({ setupMs: 2, totalMs: 20, inputTokens: 100, outputTokens: 1 });
 		return jevDecision;
 	});
-	return { ...harness, history, entryIds, phases, signals, release };
+	return { ...harness, history, entryIds, attempts, signals, release };
 }
 
-describe("two-stage lifecycle", () => {
+describe("history routing lifecycle", () => {
 	beforeEach(() => {
 		vi.useFakeTimers();
 		// Native AbortSignal.timeout uses real timers; bridge only that clock boundary.
@@ -1159,15 +1275,13 @@ describe("two-stage lifecycle", () => {
 		vi.restoreAllMocks();
 	});
 
-	it.each([
-		["model", "context"], ["model", "effort"], ["jev", "context"], ["jev", "effort"],
-	] as const)("cancels %s %s selection with Escape without changing effort or falling back", async (backend, phase) => {
-		const harness = twoStageHarness(backend, phase);
+	it.each(lifecycleBackends)("cancels %s selection with Escape without changing effort or retrying", async (backend) => {
+		const harness = historyHarness(backend, true);
 		harness.ctx.mode = "tui";
 		const removeInput = vi.fn();
 		harness.ctx.ui.onTerminalInput.mockReturnValue(removeInput);
 		const pending = harness.start("Continue");
-		await vi.waitFor(() => expect(harness.phases).toContain(phase));
+		await vi.waitFor(() => expect(harness.attempts).toContain(backend === "jev" ? "jev" : "model"));
 		const input = harness.ctx.ui.onTerminalInput.mock.calls[0]?.[0];
 		expect(input).toBeDefined();
 		expect(input!("a")).toBeUndefined();
@@ -1179,11 +1293,14 @@ describe("two-stage lifecycle", () => {
 		expect(decisions(harness)[0]).toMatchObject({ status: "cancelled", effort: "medium", reason: "Selection cancelled by user" });
 		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
 		expect(SettingsManager.create).not.toHaveBeenCalled();
-		if (backend === "jev") expect(harness.complete).not.toHaveBeenCalled();
+		expect(harness.complete).toHaveBeenCalledTimes(backend === "jev" ? 0 : 1);
+		expect(selectWithJev).toHaveBeenCalledTimes(backend === "model" ? 0 : 1);
+		const saved = JSON.stringify(harness.pi.appendEntry.mock.calls);
 		harness.release();
 		await vi.advanceTimersByTimeAsync(0);
 		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
 		expect(decisions(harness)).toHaveLength(1);
+		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).toBe(saved);
 	});
 
 	it.each(["success", "failure", "shutdown"] as const)("removes the Escape listener after %s", async (outcome) => {
@@ -1208,23 +1325,12 @@ describe("two-stage lifecycle", () => {
 		expect(harness.ctx.ui.onTerminalInput).not.toHaveBeenCalled();
 	});
 
-	it.each(["model", "jev"] as const)("shares one 10-second budget when %s classification takes 5 seconds", async (backend) => {
-		const harness = twoStageHarness(backend, "effort");
-		const classifyDelay = () => new Promise<void>((resolve) => setTimeout(resolve, 5_000));
-		if (backend === "jev") {
-			const classify = vi.mocked(classifyWithJev).getMockImplementation()!;
-			vi.mocked(classifyWithJev).mockImplementation(async (...args) => { await classifyDelay(); return classify(...args); });
-		} else {
-			const complete = harness.complete.getMockImplementation()!;
-			harness.complete.mockImplementation(async (...args) => {
-				if (harness.complete.mock.calls.length === 1) await classifyDelay();
-				return complete(...args);
-			});
-		}
+	it.each(["model", "jev"] as const)("times out %s effort within its attempt budget and ignores late callbacks", async (backend) => {
+		const harness = historyHarness(backend, true);
 		const pending = harness.start("Continue");
 		await vi.advanceTimersByTimeAsync(5_000);
-		expect(harness.phases).toEqual(["context", "effort"]);
-		const selectionSignal = backend === "jev" ? vi.mocked(selectWithJev).mock.calls[0]![1].signal : harness.complete.mock.calls[1]![2]!.signal;
+		expect(harness.attempts).toEqual([backend]);
+		const selectionSignal = backend === "jev" ? vi.mocked(selectWithJev).mock.calls[0]![1].signal : harness.complete.mock.calls[0]![2]!.signal;
 		expect(selectionSignal).toBe(harness.signals[0]);
 		expect(AbortSignal.timeout).toHaveBeenCalledExactlyOnceWith(10_000);
 		await vi.advanceTimersByTimeAsync(4_999);
@@ -1233,12 +1339,20 @@ describe("two-stage lifecycle", () => {
 		if (backend === "jev") {
 			expect(AbortSignal.timeout).toHaveBeenCalledTimes(2);
 			expect(harness.pi.appendEntry).not.toHaveBeenCalled();
-			await vi.advanceTimersByTimeAsync(10_000);
+			expect(harness.attempts).toEqual(["jev", "model"]);
+			expect(harness.signals.at(-1)).not.toBe(selectionSignal);
+			expect(harness.signals.at(-1)?.aborted).toBe(false);
+			expect(AbortSignal.timeout).toHaveBeenNthCalledWith(2, 10_000);
+			await vi.advanceTimersByTimeAsync(9_999);
+			expect(harness.pi.appendEntry).not.toHaveBeenCalled();
+			expect(harness.signals.at(-1)?.aborted).toBe(false);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(harness.signals.at(-1)?.aborted).toBe(true);
 		}
 		await pending;
 		expect(selectionSignal?.aborted).toBe(true);
 		expect(decisions(harness)).toEqual([expect.objectContaining({ status: "kept", reason: expect.stringContaining("router timed out"), elapsedMs: backend === "jev" ? 20_000 : 10_000,
-			routing: expect.objectContaining({ compaction: expect.objectContaining({ status: "extracted", elapsedMs: backend === "jev" ? 0 : 5_000 }) }) })]);
+			routing: expect.objectContaining({ context: expect.objectContaining({ strategy: "recent-turn", elapsedMs: 0, omitted: true }) }) })]);
 		if (backend === "jev") expect(decisions(harness)[0]?.jevTiming).toEqual({ setupMs: 2 });
 		const saved = JSON.stringify(harness.pi.appendEntry.mock.calls);
 		harness.release();
@@ -1246,148 +1360,96 @@ describe("two-stage lifecycle", () => {
 		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).toBe(saved);
 		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
 		expect(harness.ctx.thinkingLevel).toBe("medium");
-		if (backend === "jev") expect(harness.complete).toHaveBeenCalledTimes(2);
-		else expect(selectWithJev).not.toHaveBeenCalled();
-	});
-
-	it.each(["model", "jev"] as const)("never launches selection after a %s classifier ignores the deadline", async (backend) => {
-		const harness = twoStageHarness(backend, "context");
-		const pending = harness.start("Continue");
-		await vi.advanceTimersByTimeAsync(backend === "jev" ? 20_000 : 10_000);
-		await pending;
-		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: expect.stringContaining("router timed out"), routing: { compaction: { status: "extracting" } } });
-		expect(decisions(harness)[0]?.routing?.compaction).not.toHaveProperty("elapsedMs");
-		const saved = JSON.stringify(harness.pi.appendEntry.mock.calls);
-		harness.release();
-		await vi.advanceTimersByTimeAsync(10_000);
-		expect(harness.phases).toEqual(backend === "jev" ? ["context", "context"] : ["context"]);
-		expect(selectWithJev).not.toHaveBeenCalled();
 		expect(harness.complete).toHaveBeenCalledTimes(1);
-		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).toBe(saved);
-		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
+		expect(selectWithJev).toHaveBeenCalledTimes(backend === "jev" ? 1 : 0);
 	});
 
-	for (const backend of ["model", "jev"] as const) {
-		for (const phase of ["context", "effort"] as const) {
-			it.each(["model", "effort", "off-on", "shutdown"] as const)(`invalidates ${backend} ${phase} after %s even when settings return to their original values`, async (change) => {
-				const original = createModel();
-				const harness = twoStageHarness(backend, phase, original);
-				const pending = harness.start("Continue");
-				await vi.advanceTimersByTimeAsync(0);
-				expect(harness.phases.at(-1)).toBe(phase);
-				if (change === "model") {
-					const next = createModel("next");
-					await harness.pi.setModel(next);
-					await harness.emit({ type: "model_select", model: next, previousModel: original, source: "set" });
-					await harness.pi.setModel(original);
-					await harness.emit({ type: "model_select", model: original, previousModel: next, source: "set" });
-				} else if (change === "effort") {
-					harness.pi.setThinkingLevel("low");
-					await harness.emit({ type: "thinking_level_select", level: "low", previousLevel: "medium" });
-					harness.pi.setThinkingLevel("medium");
-					await harness.emit({ type: "thinking_level_select", level: "medium", previousLevel: "low" });
-				} else if (change === "off-on") {
-					await harness.command("off");
-					await harness.command("on");
-				} else await harness.emit({ type: "session_shutdown", reason: "reload" });
-				await pending;
-				expect(harness.signals.at(-1)?.aborted).toBe(true);
-				if (change === "shutdown") expect(harness.pi.appendEntry).not.toHaveBeenCalled();
-				else expect(decisions(harness)).toEqual([expect.objectContaining({
-					status: change === "off-on" ? "cancelled" : "kept",
-					reason: change === "off-on" ? "Auto disabled during selection" : "Model, effort or session changed during selection",
-				})]);
-				const saved = JSON.stringify(harness.pi.appendEntry.mock.calls);
-				harness.release();
-				await vi.advanceTimersByTimeAsync(0);
-				expect(harness.phases).toEqual(phase === "context" ? ["context"] : ["context", "effort"]);
-				expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).toBe(saved);
-				expect(harness.ctx.model).toBe(original);
-				expect(harness.ctx.thinkingLevel).toBe("medium");
-				expect(harness.pi.setThinkingLevel).toHaveBeenCalledTimes(change === "effort" ? 2 : 0);
-				expect(harness.ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-auto-selecting", undefined);
-				if (change === "shutdown") {
-					await harness.start("New task after shutdown");
-					expect(harness.pi.appendEntry).not.toHaveBeenCalled();
-				}
-			});
-		}
+	for (const backend of lifecycleBackends) {
+		it.each(["model", "effort", "off-on", "shutdown"] as const)(`invalidates ${backend} selection after %s even when settings return to their original values`, async (change) => {
+			const original = createModel();
+			const harness = historyHarness(backend, true, original);
+			const pending = harness.start("Continue");
+			await vi.advanceTimersByTimeAsync(0);
+			expect(harness.attempts.at(-1)).toBe(backend === "jev" ? "jev" : "model");
+			if (change === "model") {
+				const next = createModel("next");
+				await harness.pi.setModel(next);
+				await harness.emit({ type: "model_select", model: next, previousModel: original, source: "set" });
+				await harness.pi.setModel(original);
+				await harness.emit({ type: "model_select", model: original, previousModel: next, source: "set" });
+			} else if (change === "effort") {
+				harness.pi.setThinkingLevel("low");
+				await harness.emit({ type: "thinking_level_select", level: "low", previousLevel: "medium" });
+				harness.pi.setThinkingLevel("medium");
+				await harness.emit({ type: "thinking_level_select", level: "medium", previousLevel: "low" });
+			} else if (change === "off-on") {
+				await harness.command("off");
+				await harness.command("on");
+			} else await harness.emit({ type: "session_shutdown", reason: "reload" });
+			await pending;
+			expect(harness.signals.at(-1)?.aborted).toBe(true);
+			if (change === "shutdown") expect(harness.pi.appendEntry).not.toHaveBeenCalled();
+			else expect(decisions(harness)).toEqual([expect.objectContaining({
+				status: change === "off-on" ? "cancelled" : "kept",
+				reason: change === "off-on" ? "Auto disabled during selection" : "Model, effort or session changed during selection",
+			})]);
+			const saved = JSON.stringify(harness.pi.appendEntry.mock.calls);
+			harness.release();
+			await vi.advanceTimersByTimeAsync(0);
+			expect(harness.attempts).toEqual([backend === "jev" ? "jev" : "model"]);
+			expect(selectWithJev).toHaveBeenCalledTimes(backend === "model" ? 0 : 1);
+			expect(harness.complete).toHaveBeenCalledTimes(backend === "jev" ? 0 : 1);
+			expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).toBe(saved);
+			expect(harness.ctx.model).toBe(original);
+			expect(harness.ctx.thinkingLevel).toBe("medium");
+			expect(harness.pi.setThinkingLevel).toHaveBeenCalledTimes(change === "effort" ? 2 : 0);
+			expect(harness.ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-auto-selecting", undefined);
+			if (change === "shutdown") {
+				await harness.start("New task after shutdown");
+				expect(harness.pi.appendEntry).not.toHaveBeenCalled();
+			}
+		});
 	}
 
-	it.each(["context", "effort"] as const)("restarts with the current model after Jev %s failure", async (phase) => {
-		const harness = twoStageHarness("jev");
-		if (phase === "context") vi.mocked(classifyWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
-		else vi.mocked(selectWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+	it("makes one effort call in the current-model fallback after Jev selection fails", async () => {
+		const harness = historyHarness("fallback");
 		await harness.start("Continue");
-		expect(classifyWithJev).toHaveBeenCalledTimes(1);
-		expect(selectWithJev).toHaveBeenCalledTimes(phase === "effort" ? 1 : 0);
-		expect(harness.complete).toHaveBeenCalledTimes(2);
+		expect(selectWithJev).toHaveBeenCalledTimes(1);
+		expect(harness.complete).toHaveBeenCalledTimes(1);
+		expect(requestPayload(harness)).not.toHaveProperty("candidates");
+		expect(requestPayload(harness)).toMatchObject({ task: "Continue", contextOmitted: true });
+		expect(requestPayload(harness)).toEqual(vi.mocked(selectWithJev).mock.calls[0]![1].state);
+		expect(requestPayload(harness).recentConversation).toContain(harness.history[2]);
+		for (const history of harness.history.slice(0, 2)) expect(requestPayload(harness).recentConversation).not.toContain(history);
+		expect(harness.complete.mock.calls[0]![1].systemPrompt).toContain('"effort"');
+		expect(decisions(harness)[0]?.routing?.context).toMatchObject({ strategy: "recent-turn", omitted: true,
+			sources: [{ entryId: harness.entryIds[2], role: "user", start: 0, end: 2_500 }] });
 		expect(harness.ctx.thinkingLevel).toBe("high");
 		expect(decisions(harness)[0]).toMatchObject({ routerModel: "test/current", reason: expect.stringContaining("current-model fallback:") });
-		expect(decisions(harness)[0]?.contextDecisions).toBeUndefined();
 		expect(decisions(harness)[0]?.routerConfidence).toBeUndefined();
 	});
 
-	it("keeps effort when fallback classification succeeds but required context exceeds the budget", async () => {
+	it("restores the configured effort immediately when the fallback effort call also fails", async () => {
 		vi.mocked(SettingsManager.create).mockReturnValue(SettingsManager.inMemory({ defaultThinkingLevel: "low" }));
-		const harness = twoStageHarness("jev");
-		vi.mocked(classifyWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
-		harness.complete.mockImplementationOnce(async (model, context) => {
-			const content = context.messages[0]!.content;
-			if (!Array.isArray(content) || content[0]?.type !== "text") throw new Error("Missing request");
-			const { candidates } = JSON.parse(content[0].text) as { candidates: { id: string }[] };
-			return routerResponse(model, { content: [{ type: "text", text: JSON.stringify(candidates.map(({ id }) => ({ id, importance: "required" }))) }] });
-		});
+		const harness = historyHarness("fallback");
+		harness.complete.mockRejectedValueOnce(new Error("fallback effort failed"));
 		await harness.start("Continue");
-		expect(harness.complete).toHaveBeenCalledTimes(1);
-		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
-		expect(SettingsManager.create).not.toHaveBeenCalled();
-		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: expect.stringContaining("fallback skipped: required_context_exceeds_budget") });
-	});
-
-	it("restores the configured effort immediately when the fallback classifier also fails", async () => {
-		vi.mocked(SettingsManager.create).mockReturnValue(SettingsManager.inMemory({ defaultThinkingLevel: "low" }));
-		const harness = twoStageHarness("jev");
-		vi.mocked(classifyWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
-		harness.complete.mockRejectedValueOnce(new Error("fallback classifier failed"));
-		await harness.start("Continue");
-		expect(classifyWithJev).toHaveBeenCalledTimes(1);
-		expect(selectWithJev).not.toHaveBeenCalled();
+		expect(selectWithJev).toHaveBeenCalledTimes(1);
 		expect(harness.complete).toHaveBeenCalledTimes(1);
 		expect(harness.ctx.thinkingLevel).toBe("low");
 		expect(decisions(harness)[0]?.reason).toContain("restored Pi default effort (low)");
 	});
 
-	it.each(["model", "jev"] as const)("keeps effort when %s required context overflows without selecting or falling back", async (backend) => {
-		const harness = twoStageHarness(backend);
-		if (backend === "jev") vi.mocked(classifyWithJev).mockImplementationOnce(async (_key, { candidates }) => candidates.map(({ id }) => ({ id, importance: "required" })));
-		else harness.complete.mockImplementationOnce(async (model, context) => {
-			const content = context.messages[0]!.content;
-			if (!Array.isArray(content) || content[0]?.type !== "text") throw new Error("Missing request");
-			const { candidates } = JSON.parse(content[0].text) as { candidates: { id: string }[] };
-			return routerResponse(model, { content: [{ type: "text", text: JSON.stringify(candidates.map(({ id }) => ({ id, importance: "required" }))) }] });
-		});
-		await harness.start("Continue");
-		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: "required_context_exceeds_budget", effort: "medium",
-			routing: { compaction: { status: "failed", selectedCount: 0, sources: [], ratings: [
-				{ id: "c0:0:2500", importance: "required" }, { id: "c1:0:2500", importance: "required" }, { id: "c2:0:2500", importance: "required" },
-			] } } });
-		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
-		expect(selectWithJev).not.toHaveBeenCalled();
-		expect(classifyWithJev).toHaveBeenCalledTimes(backend === "jev" ? 1 : 0);
-		expect(harness.complete).toHaveBeenCalledTimes(backend === "model" ? 1 : 0);
-	});
-
 	for (const backend of ["model", "jev"] as const) {
 		it.each([true, false])(`applies max through ${backend} with xhigh supported: %s`, async (xhigh) => {
 			const model = createModel("current", { thinkingLevelMap: { max: "max", xhigh: xhigh ? "xhigh" : null } });
-			const harness = twoStageHarness(backend, undefined, model);
+			const harness = historyHarness(backend, false, model);
 			if (backend === "jev") vi.mocked(selectWithJev).mockResolvedValueOnce({ ...jevDecision, effort: "max", probabilities: { max: 1 } });
 			else {
 				const complete = harness.complete.getMockImplementation()!;
 				harness.complete.mockImplementation(async (...args) => {
 					const response = await complete(...args);
-					return harness.complete.mock.calls.length === 2 ? { ...response, content: [{ type: "text", text: '{"effort":"max"}' }] } : response;
+					return { ...response, content: [{ type: "text", text: '{"effort":"max"}' }] };
 				});
 			}
 			await harness.start("Prove the interacting system invariants");
@@ -1400,33 +1462,34 @@ describe("two-stage lifecycle", () => {
 		});
 	}
 
-	it.each(["model", "jev"] as const)("persists private-text-free %s diagnostics, source ranges, ratings and numeric usage", async (backend) => {
-		const harness = twoStageHarness(backend);
+	it.each(lifecycleBackends)("persists private-text-free %s diagnostics, source ranges and numeric usage", async (backend) => {
+		const harness = historyHarness(backend);
 		const task = "private-current-task".padEnd(12_001, "t");
 		const before = harness.ctx.sessionManager.buildSessionContext().messages;
 		await harness.start(task);
 		const decision = decisions(harness)[0]!;
-		expect(decision.routing).toMatchObject({ taskTruncated: true, selectionMs: expect.any(Number),
-			compaction: { status: "extracted", candidateCount: 3, selectedCount: 1, candidatesTruncated: false,
-				sources: [{ entryId: harness.entryIds[1], role: "user", start: 0, end: 2_500 }],
-				ratings: [{ id: "c0:0:2500", importance: "irrelevant" }, { id: "c1:0:2500", importance: "required" }, { id: "c2:0:2500", importance: "irrelevant" }] } });
+		const payload = backend === "jev" ? vi.mocked(selectWithJev).mock.calls[0]![1].state : requestPayload(harness);
+		expect(payload).toMatchObject({ taskTruncated: false, contextOmitted: true });
+		expect(payload.task).toBe(task);
+		expect(decision.routing).toMatchObject({ taskTruncated: false, selectionMs: expect.any(Number) });
+		expect(decision.routing!.context).toEqual({ strategy: "recent-turn", omitted: true,
+			characters: payload.recentConversation!.length, elapsedMs: expect.any(Number),
+			sources: [{ entryId: harness.entryIds[2], role: "user", start: 0, end: 2_500 }] });
+		expect(decision.routing).not.toHaveProperty("compaction");
+		expect(decision).not.toHaveProperty("contextTiming");
+		expect(decision).not.toHaveProperty("contextDecisions");
+		expect(harness.complete).toHaveBeenCalledTimes(backend === "jev" ? 0 : 1);
+		expect(selectWithJev).toHaveBeenCalledTimes(backend === "model" ? 0 : 1);
 		if (backend === "jev") {
-			expect(decision.contextTiming).toMatchObject({ inputTokens: 120, outputTokens: 3 });
-			expect(decision.contextDecisions).toHaveLength(3);
-			expect(decision.contextDecisions?.[1]).toEqual({ id: "c1:0:2500", importance: "required", confidence: 1, probabilities: { required: 1, useful: 0, background: 0, irrelevant: 0 } });
 			expect(decision.jevTiming).toMatchObject({ inputTokens: 100, outputTokens: 1 });
 			expect(decision.routerProbabilities).toEqual(jevDecision.probabilities);
-			const context = vi.mocked(classifyWithJev).mock.calls[0]![1];
-			const selection = vi.mocked(selectWithJev).mock.calls[0]![1];
-			expect(context.taskTruncated).toBe(true);
-			expect(selection.state.taskTruncated).toBe(true);
-			expect(context.task).toHaveLength(12_000);
-			expect(context.task).toBe(selection.state.task);
+			expect(decision.selectorUsage).toBeUndefined();
+			expect(decision.selectorResponses).toBeUndefined();
 		} else {
 			expect(decision.selectorUsage).toEqual({
-				context: { input: 120, output: 15, cacheRead: 3, cacheWrite: 2, cost: 0.03 },
 				effort: { input: 120, output: 15, cacheRead: 3, cacheWrite: 2, cost: 0.03 },
 			});
+			expect(Object.keys(decision.selectorResponses!)).toEqual(["effort"]);
 		}
 		const serialized = JSON.stringify(harness.pi.appendEntry.mock.calls);
 		for (const secret of ["private-current-task", ...harness.history, "test-key", "test-typesafe-key", "userPrompt", "systemPrompt", '"candidates":']) expect(serialized).not.toContain(secret);
@@ -1435,11 +1498,11 @@ describe("two-stage lifecycle", () => {
 		await restored.emit({ type: "session_start", reason: "resume" });
 		await restored.command("status");
 		expect(decisions(restored)).toEqual([decision]);
-		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain("Context: extracted");
-		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain("1 of 3 blocks retained");
-		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain(`Source: ${harness.entryIds[1]}`);
-		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain("2. user | required | retained");
-		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain("Task truncated: true");
+		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain("Context: recent-turn");
+		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain("1 messages retained · omitted: yes");
+		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain(`Source: ${harness.entryIds[2]}`);
+		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain("1. user");
+		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain("Task truncated: false");
 	});
 
 	it.each([undefined, "0", "1"])("records response diagnostics with opt-in raw text: %s", async (debug) => {
@@ -1479,12 +1542,13 @@ describe("two-stage lifecycle", () => {
 		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).not.toContain("private-provider-error");
 	});
 
-	it("keeps context and effort replies separately without displaying raw text", async () => {
+	it("records only the current-model effort reply without displaying raw text", async () => {
 		vi.stubEnv("PI_AUTO_DEBUG", "1");
-		const harness = twoStageHarness("model");
+		const harness = historyHarness("model");
 		await harness.start("Task");
 		const responses = decisions(harness)[0]?.selectorResponses;
-		expect(JSON.parse(responses!.context!.rawText!)).toHaveLength(3);
+		expect(Object.keys(responses!)).toEqual(["effort"]);
+		expect(harness.complete).toHaveBeenCalledTimes(1);
 		expect(JSON.parse(responses!.effort!.rawText!)).toMatchObject({ effort: "high" });
 		await harness.command("status");
 		expect(harness.ctx.ui.notify.mock.lastCall?.[0]).not.toContain(responses!.effort!.rawText!);
@@ -1520,18 +1584,5 @@ describe("two-stage lifecycle", () => {
 			stopReason: "stop", textCharacters: 0, contentTypes: ["thinking"], rawText: "", rawTextTruncated: false,
 		});
 		expect(decisions(harness)[0]?.reason).toContain("router returned no decision");
-	});
-
-	it("does not save invalid model classification response bodies or start selection", async () => {
-		const harness = twoStageHarness("model");
-		harness.complete.mockResolvedValueOnce(routerResponse(harness.ctx.model!, { content: [{ type: "text", text: 'private-response-body private-current-task' }] }));
-		await harness.start("private-current-task");
-		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: "context_classification_failed; restored Pi default effort (medium)" });
-		expect(harness.complete).toHaveBeenCalledTimes(1);
-		expect(selectWithJev).not.toHaveBeenCalled();
-		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
-		const saved = JSON.stringify(harness.pi.appendEntry.mock.calls);
-		expect(saved).not.toContain("private-response-body");
-		expect(saved).not.toContain("private-current-task");
 	});
 });

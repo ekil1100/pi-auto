@@ -12,19 +12,12 @@ function decision(): EffortDecision {
 		routerConfidence: 0.8, routerProbabilities: { low: 0.1, medium: 0.1, high: 0.8 },
 		routing: {
 			policyVersion: "1", supportedEfforts: ["low", "medium", "high"], taskTruncated: false, selectionMs: 200,
-			compaction: {
-				status: "extracted", candidateCount: 3, candidateCharacters: 9_000, selectedCount: 2, selectedCharacters: 3_000,
-				candidatesTruncated: false, elapsedMs: 120,
-				candidateSources: [
-					{ id: "c0:0:900", entryId: "user-source", role: "user", start: 0, end: 900 },
-					{ id: "c1:0:2100", entryId: "reply-source", role: "assistant", start: 0, end: 2_100 },
-					{ id: "c2:0:5000", entryId: "oversize-source", role: "user", start: 0, end: 5_000 },
-				],
+			context: {
+				strategy: "recent-turn", omitted: true, characters: 3_000, elapsedMs: 0.2,
 				sources: [
 					{ entryId: "user-source", role: "user", start: 0, end: 900 },
 					{ entryId: "reply-source", role: "assistant", start: 0, end: 2_100 },
 				],
-				ratings: [{ id: "c0:0:900", importance: "background" }, { id: "c1:0:2100", importance: "required" }, { id: "c2:0:5000", importance: "useful" }],
 			},
 		},
 	};
@@ -57,51 +50,50 @@ describe("status information hierarchy", () => {
 		expect(overview).not.toMatch(/Confidence|Policy|socket|Candidate:/);
 	});
 
-	it("distinguishes classification from retention and exposes complete source metadata", () => {
+	it("shows recent-turn source ranges, omissions, characters and local elapsed time", () => {
 		const context = text(status(), 1);
-		expect(context).toContain("1. user | background | retained");
-		expect(context).toContain("2. assistant | required | retained");
-		expect(context).toContain("3. user | useful | not retained");
-		expect(context).toContain("Source: oversize-source\n   Range: 0-5000 | Candidate: c2:0:5000");
-		expect(context).toContain("Candidate pool incomplete: no");
-		expect(context).toContain("omitted: yes");
-		expect(context).not.toContain("budget exceeded"); // No inferred per-candidate explanations.
+		for (const value of ["Context: recent-turn", "1. user", "2. assistant", "Source: user-source",
+			"Source: reply-source", "Range: 0-2100", "2 messages retained · omitted: yes",
+			"History: 3000 UTF-16 units", "Local elapsed: 0.2ms", "[start, end)", "message text is not displayed"]) {
+			expect(context).toContain(value);
+		}
+		expect(context).not.toMatch(/Candidate|classification|rating|packed|background|required/);
 	});
 
-	it("marks bypassed history as unclassified and distinguishes pool omissions", () => {
+	it.each([true, false])("uses the recorded omitted flag (%j) rather than inferring it from source counts", (omitted) => {
 		const last = decision();
-		const context = last.routing!.compaction!;
-		context.status = "bypassed";
-		context.ratings = [];
-		context.candidatesTruncated = true;
-		expect(text(status(last), 1)).toContain("user | not classified | retained");
-		expect(text(status(last), 1)).toContain("Candidate pool incomplete: yes");
+		last.routing!.context!.omitted = omitted;
+		expect(text(status(last), 1)).toContain(`2 messages retained · omitted: ${omitted ? "yes" : "no"}`);
 	});
 
-	it.each(["failed", "extracting"] as const)("does not invent rejection decisions for %s packing", (phase) => {
+	it("distinguishes empty recorded context from missing diagnostics", () => {
+		const last = decision();
+		Object.assign(last.routing!.context!, { sources: [], characters: 0, omitted: false, elapsedMs: 0 });
+		const page = text(status(last), 1);
+		expect(page).toContain("0 messages retained · omitted: no");
+		expect(page).toContain("No messages retained.");
+		expect(page).toContain("Local elapsed: 0ms");
+		expect(page).not.toContain("No context diagnostics recorded.");
+	});
+
+	it("keeps the outcome reason visible for unsuccessful selections", () => {
 		const last = decision();
 		last.status = "kept";
-		last.reason = "required_context_exceeds_budget";
-		const context = last.routing!.compaction!;
-		context.status = phase;
-		context.sources = [];
-		context.selectedCount = 0;
-		context.selectedCharacters = 0;
-		const page = text(status(last), 1);
-		expect(page).toContain(`${phase} · no packed context`);
-		expect(page).toContain("required | not packed");
-		expect(page).not.toContain("not retained");
+		last.reason = "Selector request failed";
 		const overview = buildStatusPages(status(last))[0]!;
-		expect(overview.lines.find(({ text }) => text.startsWith("Reason:"))?.tone).toBe("warning");
+		expect(overview.lines.find(({ text }) => text.startsWith("Reason:"))).toEqual({ text: "Reason: Selector request failed", tone: "warning" });
 	});
 
-	it("preserves legacy source and rating visibility without inventing their association", () => {
+	it("does not infer recent-turn context from deprecated classification diagnostics", () => {
 		const last = decision();
-		delete last.routing!.compaction!.candidateSources;
-		const page = text(status(last), 1);
-		expect(page).toContain("Candidate/source mapping was not recorded.");
-		expect(page).toContain("Retained: user | user-source | 0-900");
-		expect(page).toContain("Candidate c0:0:900: background | retention unknown");
+		delete last.routing!.context;
+		Object.assign(last.routing!, { compaction: { status: "extracted", sources: [{ entryId: "old-source" }], ratings: [] } });
+		Object.assign(last, { contextTiming: { totalMs: 120 }, contextDecisions: [{ id: "old-candidate" }] });
+		const restored = readDecision({ type: "custom", customType: DECISION_ENTRY_TYPE, id: "decision", parentId: null, timestamp: "2026-01-01", data: last });
+		expect(restored).toMatchObject({ status: "selected", effort: "high" });
+		const pages = buildStatusPages(status(restored));
+		expect(pages[1]!.lines).toEqual([{ text: "No context diagnostics recorded.", tone: "dim" }]);
+		expect(JSON.stringify(pages)).not.toMatch(/old-source|old-candidate|120ms|classification/);
 	});
 
 	it("renders empty and legacy states without fabricating metrics", () => {
@@ -116,26 +108,25 @@ describe("status information hierarchy", () => {
 		delete state.last.routerProbabilities;
 		expect(text(state, 2)).toContain("Policy metadata not recorded.");
 		expect(text(state, 2)).toContain("Usage not recorded.");
-		expect(text(state, 2)).not.toMatch(/Confidence:|0 input|Context stage:/);
+		expect(text(state, 2)).not.toMatch(/Confidence:|0 input|Local context:/);
 	});
 
 	it("keeps complete probabilities and usage accessible without success-rate claims", () => {
 		const last = decision();
 		last.jevTiming = { outputTokens: 1 }; // Unknown input is not zero.
-		last.contextDecisions = [{ id: "c0:0:900", importance: "background", confidence: 0.7,
-			probabilities: { required: 0.1, useful: 0.1, background: 0.7, irrelevant: 0.1 } }];
+
 		const page = text(status(last), 2);
-		for (const value of ["low: 0.1", "high: 0.8", "background: 0.7", "confidence 0.7", "not task success probability", "not included in Pi footer", "unknown input / 1 output"]) expect(page).toContain(value);
+		for (const value of ["low: 0.1", "high: 0.8", "not task success probability", "not included in Pi footer", "unknown input / 1 output"]) expect(page).toContain(value);
 	});
 
-	it("round trips bounded metadata without storing candidate text or dependencies", () => {
+	it("round trips bounded metadata without storing message text or dependencies", () => {
 		const last = decision();
 		const entry = { type: "custom" as const, customType: DECISION_ENTRY_TYPE, id: "decision", parentId: null, timestamp: "2026-01-01", data: last };
 		expect(readDecision(JSON.parse(JSON.stringify(entry)))).toEqual(last);
-		const source = last.routing!.compaction!.candidateSources![0]!;
-		for (const candidateSources of [null, {}, Array(33).fill(source), [{ ...source, end: -1 }], [{ ...source, id: 42 }], [{ ...source, text: "private" }], [{ ...source, requires: [] }]]) {
+		const source = last.routing!.context!.sources[0]!;
+		for (const sources of [null, {}, Array(3).fill(source), [{ ...source, end: -1 }], [{ ...source, entryId: 42 }], [{ ...source, text: "private" }], [{ ...source, requires: [] }]]) {
 			const bad = structuredClone(entry);
-			Object.assign(bad.data.routing!.compaction!, { candidateSources });
+			Object.assign(bad.data.routing!.context!, { sources });
 			expect(readDecision(bad)).toBeUndefined();
 		}
 	});
@@ -143,7 +134,7 @@ describe("status information hierarchy", () => {
 	it("removes terminal control sequences from all externally supplied fields", () => {
 		const state = status();
 		state.model = "test/\x1b[31mmodel\x1b[0m\x07";
-		state.last!.routing!.compaction!.candidateSources![0]!.entryId = "entry\x1b]52;c;private\x07\nspoof";
+		state.last!.routing!.context!.sources[0]!.entryId = "entry\x1b]52;c;private\x07\nspoof";
 		state.last!.reason = "reason\r\nother line";
 		const pages = buildStatusPages(state);
 		for (const page of pages) for (const line of page.lines) expect(line.text).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
@@ -152,7 +143,7 @@ describe("status information hierarchy", () => {
 });
 
 describe("status floating viewport", () => {
-	it("switches three tabs, scrolls to all candidates, and closes via the injected keybinding", () => {
+	it("switches three tabs, scrolls to all sources, and closes via the injected keybinding", () => {
 		const view = panel();
 		expect(view.render().join("\n")).toContain("[Overview]");
 		view.component.handleInput("\t");
@@ -162,8 +153,8 @@ describe("status floating viewport", () => {
 			seen.push(...view.render());
 			view.component.handleInput("\x1b[B");
 		}
-		expect(seen.join("\n")).toContain("Source: oversize-source");
-		expect(seen.join("\n")).toContain("Candidate: c2:0:5000");
+		expect(seen.join("\n")).toContain("Source: reply-source");
+		expect(seen.join("\n")).toContain("Range: 0-2100");
 		view.component.handleInput("\t");
 		expect(view.render().join("\n")).toContain("[Diagnostics]");
 		view.component.handleInput("\t");
@@ -186,7 +177,7 @@ describe("status floating viewport", () => {
 		expect(view.render().join("\n")).toBe(top);
 		for (let index = 0; index < 100; index++) view.component.handleInput(down);
 		const bottom = view.render().join("\n");
-		expect(bottom).toContain("Source: oversize-source");
+		expect(bottom).toContain("Source: reply-source");
 		view.component.handleInput(down);
 		expect(view.render().join("\n")).toBe(bottom);
 		view.component.handleInput(up);
@@ -214,7 +205,7 @@ describe("status floating viewport", () => {
 		view.component.handleInput("\x0e");
 		expect(view.render().join("\n")).toContain("[Context]");
 		view.component.handleInput("f");
-		expect(view.render().join("\n")).not.toContain("Context: extracted");
+		expect(view.render().join("\n")).not.toContain("Context: recent-turn");
 		view.component.handleInput("\x1b");
 		expect(view.done).not.toHaveBeenCalled();
 		view.component.handleInput("\x11");
@@ -224,7 +215,7 @@ describe("status floating viewport", () => {
 	it.each([[96, 40], [60, 24], [32, 18], [24, 12], [12, 6], [1, 3]])("fits %i columns / %i rows including wide text and long IDs", (width, rows) => {
 		const state = status();
 		state.last!.reason = "中文👨‍👩‍👧‍👦 full-width text ".repeat(8);
-		state.last!.routing!.compaction!.candidateSources![0]!.entryId = "long-source-id-".repeat(20);
+		state.last!.routing!.context!.sources[0]!.entryId = "long-source-id-".repeat(20);
 		const view = panel(state, rows);
 		for (let page = 0; page < 3; page++) {
 			const lines = view.render(width);
@@ -258,15 +249,9 @@ describe("status floating viewport", () => {
 		["\x1b[6~", "\x1b[5~"], ["\t", "j"],
 	])("preserves input after switching pages without an intervening paint: %j", (...keys) => {
 		const state = status();
-		const context = state.last!.routing!.compaction!;
-		context.candidateSources = Array.from({ length: 32 }, (_, index) => ({
-			id: `c${index}:0:100`, entryId: `source-${index}`, role: "user", start: 0, end: 100,
-		}));
-		context.candidateCount = 32;
-		context.ratings = [];
-		context.sources = [];
-		context.selectedCount = 0;
-		context.selectedCharacters = 0;
+		const context = state.last!.routing!.context!;
+		context.sources[0]!.entryId = "long-user-source-".repeat(100);
+		context.sources[1]!.entryId = "long-assistant-source-".repeat(100);
 		const queued = panel(state, 40);
 		const repainted = panel(state, 40);
 		queued.render(96);
@@ -330,7 +315,7 @@ describe("status floating viewport", () => {
 		const page = view.render(60).join("\n");
 		expect(page).toContain("Current effort: low");
 		expect(page).toContain("medium -> high | selected | 0.32s");
-		expect(page).toContain("2 of 3 blocks retained");
+		expect(page).toContain("2 messages retained");
 	});
 
 	it("shows scrolling and closing hints in a narrow viewport", () => {
@@ -355,7 +340,7 @@ describe("status floating viewport", () => {
 		view.component.invalidate();
 		const wide = view.component.render(96);
 		expect(wide.join("\n")).toContain("\x1b[32m");
-		expect(wide.map(stripVTControlCharacters).join("\n")).toContain("Context: extracted");
+		expect(wide.map(stripVTControlCharacters).join("\n")).toContain("Context: recent-turn");
 	});
 
 	it.each(["rpc", "print", "json"] as const)("does not instantiate a terminal component in %s mode", async (mode) => {

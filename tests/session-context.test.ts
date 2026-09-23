@@ -1,7 +1,7 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { collectHistory, hasContextImages } from "../src/session-context.ts";
-import { buildContextCandidates, packContext } from "../src/context-compaction.ts";
+import { getRecentContext } from "../src/recent-context.ts";
 
 function entry(id: string, role: string, content: unknown): SessionEntry {
 	return { id, type: "message", message: { role, content, timestamp: 0 } } as SessionEntry;
@@ -64,17 +64,17 @@ describe("collectHistory", () => {
 	});
 
 	it("never attributes an image-only user's reply to a previous text user", () => {
-		const pool = buildContextCandidates(collectHistory([
+		const result = getRecentContext(collectHistory([
 			entry("u1", "user", "Old text request"), entry("a1", "assistant", "Old reply"),
 			entry("u2", "user", [image]), entry("a2", "assistant", "Reply to image"),
 		]));
-		const oldReply = pool.candidates.find(({ entryId }) => entryId === "a1")!;
-		const imageReply = pool.candidates.find(({ entryId }) => entryId === "a2")!;
-		expect(imageReply).toMatchObject({ partialTurn: true, requires: [] });
-		expect(imageReply.turnId).not.toBe(oldReply.turnId);
-		expect(JSON.stringify(pool)).not.toContain(image.data);
-		const result = packContext(pool);
-		expect(result.status === "ready" && result.text).toContain("partialTurn=true");
+		expect(result.sources).toEqual([
+			{ entryId: "u2", role: "user", start: 0, end: 0 },
+			{ entryId: "a2", role: "assistant", start: 0, end: 14 },
+		]);
+		expect(result.text).toContain("Reply to image");
+		expect(result.omitted).toBe(true);
+		for (const excluded of ["Old text request", "Old reply", image.data]) expect(JSON.stringify(result)).not.toContain(excluded);
 	});
 
 	it("uses only the active entries provided by the caller, without following abandoned parents", () => {

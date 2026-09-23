@@ -1,10 +1,8 @@
 import { setImmediate } from "node:timers/promises";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { APIError, APITimeoutError, choice, TypeSafeClient, type EntryType, type Questions } from "@typesafe-ai/sdk";
+import { APIError, APITimeoutError, choice, TypeSafeClient } from "@typesafe-ai/sdk";
 import type { EffortState } from "./router.ts";
 import type { JevTransportTiming, TimedJevFetch } from "./jev-transport.ts";
-import type { ContextRating } from "./context-compaction.ts";
-import { CONTEXT_INSTRUCTIONS, IMPORTANCE_CRITERIA, type ContextClassificationInput } from "./context-policy.ts";
 import { EFFORT_INSTRUCTIONS, getEffortCriteria } from "./effort-policy.ts";
 
 export const JEV_MODEL = "jev-1.13.0";
@@ -37,50 +35,7 @@ export interface JevDecision {
 
 export type SelectJev = (invocation: JevInvocation) => Promise<JevDecision>;
 
-export async function selectWithJev(apiKey: string, invocation: JevInvocation, fetchJev: TimedJevFetch): Promise<JevDecision> {
-	return requestJev(apiKey, invocation, {
-		effort: choice(EFFORT_INSTRUCTIONS, getEffortCriteria(invocation.state.supportedEfforts)),
-	}, (response) => {
-		const { model, answers } = parseEnvelope(response, ["effort"]);
-		const answer = parseChoice(answers.effort, invocation.state.supportedEfforts);
-		const effort = invocation.state.supportedEfforts.find((candidate) => candidate === answer.choice)!;
-		return { effort, model, confidence: answer.confidence, probabilities: answer.probabilities };
-	}, fetchJev);
-}
-
-export type JevContextDecision = ContextRating & { confidence: number; probabilities: Record<string, number> };
-export type JevContextInvocation = ContextClassificationInput & {
-	onTiming?: JevInvocation["onTiming"];
-	onDecisions?: (decisions: JevContextDecision[]) => void;
-};
-
-export async function classifyWithJev(apiKey: string, input: JevContextInvocation, fetchJev: TimedJevFetch): Promise<ContextRating[]> {
-	const keys = input.candidates.map((_candidate, index) => `block_${index}`);
-	const questions = Object.fromEntries(input.candidates.map((_candidate, index) => [keys[index]!,
-		choice(`${CONTEXT_INSTRUCTIONS}\nEvaluate candidates[${index}].text and its turn dependencies.`, IMPORTANCE_CRITERIA),
-	]));
-	return requestJev(apiKey, {
-		state: { task: input.task, taskTruncated: input.taskTruncated, candidates: [...input.candidates], candidatesTruncated: input.candidatesTruncated },
-		signal: input.signal,
-		...(input.onTiming ? { onTiming: input.onTiming } : {}),
-	}, questions, (response) => {
-		const { answers } = parseEnvelope(response, keys);
-		const decisions = input.candidates.map((candidate, index): JevContextDecision => {
-			const answer = parseChoice(answers[keys[index]!], Object.keys(IMPORTANCE_CRITERIA));
-			return { id: candidate.id, importance: answer.choice as ContextRating["importance"], confidence: answer.confidence, probabilities: answer.probabilities };
-		});
-		try { input.onDecisions?.(structuredClone(decisions)); } catch { /* Diagnostics must not change selection. */ }
-		return decisions.map(({ id, importance }) => ({ id, importance }));
-	}, fetchJev);
-}
-
-async function requestJev<T>(
-	apiKey: string,
-	{ state, signal, onTiming }: { state: EntryType; signal: AbortSignal; onTiming?: JevInvocation["onTiming"] },
-	questions: Questions,
-	parse: (response: unknown) => T,
-	fetchJev: TimedJevFetch,
-): Promise<T> {
+export async function selectWithJev(apiKey: string, { state, signal, onTiming }: JevInvocation, fetchJev: TimedJevFetch): Promise<JevDecision> {
 	const startedAt = performance.now();
 	const timing: JevTiming = {};
 	const elapsed = (since: number) => Math.max(0, Math.round((performance.now() - since) * 10) / 10);
@@ -100,7 +55,7 @@ async function requestJev<T>(
 			logLevel: "off",
 			fetch: async (url, init) => {
 				// Let Undici return the previous response's socket to its pool before
-				// a back-to-back classification/selection request asks for a connection.
+				// a subsequent selection request asks for a connection.
 				await setImmediate(undefined, { signal: init?.signal ?? signal });
 				const fetchStartedAt = performance.now();
 				timing.setupMs = elapsed(startedAt);
@@ -119,7 +74,9 @@ async function requestJev<T>(
 		});
 		let response: unknown;
 		try {
-			response = await client.systemOne({ state, questions }, { signal });
+			response = await client.systemOne({ state, questions: {
+				effort: choice(EFFORT_INSTRUCTIONS, getEffortCriteria(state.supportedEfforts)),
+			} }, { signal });
 		} catch (error) {
 			// Do not persist SDK error bodies: the service may echo sensitive input.
 			if (signal.aborted) throw new Error("Jev request cancelled");
@@ -139,7 +96,10 @@ async function requestJev<T>(
 		try {
 			if (isRecord(response) && isRecord(response.usage) && typeof response.usage.output_tokens === "number" &&
 				Number.isSafeInteger(response.usage.output_tokens) && response.usage.output_tokens >= 0) timing.outputTokens = response.usage.output_tokens;
-			return parse(response);
+			const { model, answers } = parseEnvelope(response, ["effort"]);
+			const answer = parseChoice(answers.effort, state.supportedEfforts);
+			const effort = state.supportedEfforts.find((candidate) => candidate === answer.choice)!;
+			return { effort, model, confidence: answer.confidence, probabilities: answer.probabilities };
 		} finally {
 			timing.validateMs = elapsed(validationStartedAt);
 		}

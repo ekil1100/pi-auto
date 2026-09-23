@@ -10,8 +10,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { SettingsManager, type BeforeAgentStartEvent, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { planEffort, ROUTER_RESPONSE_TEXT_LIMIT, type RouterResponseDiagnostics, type CompleteRouter, type RouterInvocation, type JevBackend, type RoutingDiagnostics } from "./router.ts";
-import { JEV_MODEL, selectWithJev, classifyWithJev, type JevTiming } from "./jev.ts";
+import { planEffort, ROUTER_RESPONSE_TEXT_LIMIT, type RouterResponseDiagnostics, type CompleteRouter, type RouterInvocation, type RoutingDiagnostics } from "./router.ts";
+import { JEV_MODEL, selectWithJev, type SelectJev, type JevTiming } from "./jev.ts";
 import { collectHistory, hasContextImages } from "./session-context.ts";
 import { createSelectingWidget, DECISION_ENTRY_TYPE, formatAutoEffort, readDecision, renderDecisionEntry, type EffortDecision } from "./selection-ui.ts";
 import { showAutoStatus } from "./status-ui.ts";
@@ -98,8 +98,6 @@ export default function piAuto(pi: ExtensionAPI): void {
 		let routerConfidence: number | undefined;
 		let prepareMs: number | undefined;
 		let jevTiming: JevTiming | undefined;
-		let contextTiming: JevTiming | undefined;
-		let contextDecisions: EffortDecision["contextDecisions"];
 		let routerProbabilities: Record<string, number> | undefined;
 		let routing: RoutingDiagnostics | undefined;
 		const selectorUsage: NonNullable<EffortDecision["selectorUsage"]> = {};
@@ -125,28 +123,18 @@ export default function piAuto(pi: ExtensionAPI): void {
 					return completeRouter(ctx, invocation, debugResponses,
 						(usage) => { if (acceptingDiagnostics) selectorUsage[invocation.purpose] = usage; },
 						(response) => { if (acceptingDiagnostics) selectorResponses[invocation.purpose] = response; });
-				}, useJev && typesafeApiKey ? {
-					select: async (invocation) => {
-						prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
-						routerModel = `typesafe/${JEV_MODEL}`;
-						const decision = await selectWithJev(typesafeApiKey, {
-							...invocation, onTiming: (timing) => { if (acceptingDiagnostics) jevTiming = structuredClone(timing); },
-						}, jevTransport.fetch);
-						if (acceptingDiagnostics) {
-							routerModel = `typesafe/${decision.model}`;
-							routerConfidence = decision.confidence;
-							routerProbabilities = { ...decision.probabilities };
-						}
-						return decision;
-					},
-					classify: async (invocation) => {
-						prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
-						routerModel = `typesafe/${JEV_MODEL}`;
-						return classifyWithJev(typesafeApiKey, {
-							...invocation, onTiming: (timing) => { if (acceptingDiagnostics) contextTiming = structuredClone(timing); },
-							onDecisions: (values) => { if (acceptingDiagnostics) contextDecisions = structuredClone(values); },
-						}, jevTransport.fetch);
-					},
+				}, useJev && typesafeApiKey ? async (invocation) => {
+					prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
+					routerModel = `typesafe/${JEV_MODEL}`;
+					const decision = await selectWithJev(typesafeApiKey, {
+						...invocation, onTiming: (timing) => { if (acceptingDiagnostics) jevTiming = structuredClone(timing); },
+					}, jevTransport.fetch);
+					if (acceptingDiagnostics) {
+						routerModel = `typesafe/${decision.model}`;
+						routerConfidence = decision.confidence;
+						routerProbabilities = { ...decision.probabilities };
+					}
+					return decision;
 				} : undefined, (value) => { if (acceptingDiagnostics) routing = structuredClone(value); });
 			} finally {
 				// Freeze this attempt's diagnostics before aborting any non-cooperative work.
@@ -174,7 +162,6 @@ export default function piAuto(pi: ExtensionAPI): void {
 				routerEffort = undefined;
 				routerConfidence = undefined;
 				routerProbabilities = undefined;
-				contextDecisions = undefined;
 				routing = undefined;
 				result = await runSelection(false);
 			}
@@ -231,8 +218,6 @@ export default function piAuto(pi: ExtensionAPI): void {
 					...(routerConfidence !== undefined ? { routerConfidence } : {}),
 					...(prepareMs !== undefined ? { prepareMs } : {}),
 					...(jevTiming ? { jevTiming: structuredClone(jevTiming) } : {}),
-					...(contextTiming ? { contextTiming: structuredClone(contextTiming) } : {}),
-					...(contextDecisions ? { contextDecisions: structuredClone(contextDecisions) } : {}),
 					...(routerProbabilities ? { routerProbabilities: { ...routerProbabilities } } : {}),
 					...(routing ? { routing: structuredClone(routing) } : {}),
 					...(Object.keys(selectorUsage).length ? { selectorUsage: structuredClone(selectorUsage) } : {}),
@@ -251,7 +236,7 @@ async function planForEvent(
 	ctx: ExtensionContext,
 	signal: AbortSignal,
 	complete: CompleteRouter,
-	jev?: JevBackend,
+	selectJev?: SelectJev,
 	onDiagnostics?: (value: RoutingDiagnostics) => void,
 ) {
 	const contextEntries = ctx.sessionManager.buildContextEntries();
@@ -266,7 +251,7 @@ async function planForEvent(
 			...(onDiagnostics ? { onDiagnostics } : {}),
 		},
 		complete,
-		jev,
+		selectJev,
 	), signal);
 }
 

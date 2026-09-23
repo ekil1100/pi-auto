@@ -1,5 +1,5 @@
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import type { JevTiming, JevContextDecision } from "./jev.ts";
+import type { JevTiming } from "./jev.ts";
 import { ROUTER_RESPONSE_TEXT_LIMIT, type RouterResponseDiagnostics, type RoutingDiagnostics } from "./router.ts";
 import { keyHint, type EntryRenderer, type SessionEntry, type Theme } from "@earendil-works/pi-coding-agent";
 import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
@@ -22,12 +22,10 @@ export interface EffortDecision {
 	routerConfidence?: number;
 	prepareMs?: number;
 	jevTiming?: JevTiming;
-	contextTiming?: JevTiming;
-	contextDecisions?: JevContextDecision[];
 	routerProbabilities?: Record<string, number>;
 	routing?: RoutingDiagnostics;
-	selectorResponses?: Partial<Record<"context" | "effort", RouterResponseDiagnostics>>;
-	selectorUsage?: Partial<Record<"context" | "effort", { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }>>;
+	selectorResponses?: Partial<Record<"effort", RouterResponseDiagnostics>>;
+	selectorUsage?: Partial<Record<"effort", { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }>>;
 	elapsedMs: number;
 }
 
@@ -87,16 +85,14 @@ export const renderDecisionEntry: EntryRenderer<EffortDecision> = (entry, { expa
 			: theme.fg("dim", "not called")),
 		detail(decision.status === "selected" ? "Reason" : "Kept because", theme.fg(decision.status === "selected" ? "text" : "warning", inlineText(decision.reason))),
 		detail("Elapsed", theme.fg("dim", `${(decision.elapsedMs / 1000).toFixed(1)}s`)),
-		...(decision.routing?.compaction ? [detail("Context", theme.fg("text", formatContextSummary(decision.routing.compaction)))] : []),
+		...(decision.routing?.context ? [detail("Context", theme.fg("text", formatContextSummary(decision.routing.context)))] : []),
 		theme.fg("dim", "  /auto status: inspect the latest decision"),
 	];
 	return new Text(lines.join("\n"), 1, 0);
 };
 
-export function formatContextSummary(context: NonNullable<RoutingDiagnostics["compaction"]>): string {
-	if (context.status === "failed" || context.status === "extracting") return `${context.status} · no packed context`;
-	const omitted = context.candidatesTruncated || context.selectedCount < context.candidateCount;
-	return `${context.selectedCount} of ${context.candidateCount} blocks retained · omitted: ${omitted ? "yes" : "no"}`;
+export function formatContextSummary(context: NonNullable<RoutingDiagnostics["context"]>): string {
+	return `${context.sources.length} messages retained · omitted: ${context.omitted ? "yes" : "no"}`;
 }
 
 export function readDecision(entry: SessionEntry): EffortDecision | undefined {
@@ -112,20 +108,13 @@ export function readDecision(entry: SessionEntry): EffortDecision | undefined {
 			!Number.isFinite(data.routerConfidence) || data.routerConfidence < 0 || data.routerConfidence > 1)) ||
 		(data.prepareMs !== undefined && !isNonnegativeNumber(data.prepareMs)) ||
 		(data.jevTiming !== undefined && !isJevTiming(data.jevTiming)) ||
-		(data.contextTiming !== undefined && !isJevTiming(data.contextTiming)) ||
-		(data.contextDecisions !== undefined && (!Array.isArray(data.contextDecisions) || data.contextDecisions.length > 32 ||
-			!data.contextDecisions.every((item: unknown) => isRecord(item) && typeof item.id === "string" &&
-				["required", "useful", "background", "irrelevant"].includes(String(item.importance)) &&
-				isNonnegativeNumber(item.confidence) && item.confidence <= 1 && isRecord(item.probabilities) &&
-				Object.keys(item.probabilities).length === 4 && Object.entries(item.probabilities).every(([key, value]) =>
-					["required", "useful", "background", "irrelevant"].includes(key) && isNonnegativeNumber(value) && value <= 1)))) ||
 		(data.routerProbabilities !== undefined && (!isRecord(data.routerProbabilities) ||
 			!Object.entries(data.routerProbabilities).every(([key, value]) => isEffort(key) && isNonnegativeNumber(value) && value <= 1))) ||
 		(data.routing !== undefined && !isRoutingDiagnostics(data.routing)) ||
 		(data.selectorResponses !== undefined && (!isRecord(data.selectorResponses) || !Object.entries(data.selectorResponses).every(([key, value]) =>
-			["context", "effort"].includes(key) && isRouterResponseDiagnostics(value)))) ||
+			key === "effort" && isRouterResponseDiagnostics(value)))) ||
 		(data.selectorUsage !== undefined && (!isRecord(data.selectorUsage) || !Object.entries(data.selectorUsage).every(([key, value]) =>
-			["context", "effort"].includes(key) && isRecord(value) && ["input", "output", "cacheRead", "cacheWrite", "cost"].every((field) => isNonnegativeNumber(value[field]))))) ||
+			key === "effort" && isRecord(value) && ["input", "output", "cacheRead", "cacheWrite", "cost"].every((field) => isNonnegativeNumber(value[field]))))) ||
 		typeof data.elapsedMs !== "number" || !Number.isFinite(data.elapsedMs) || data.elapsedMs < 0) return undefined;
 	return data as unknown as EffortDecision;
 }
@@ -171,26 +160,21 @@ function isRoutingDiagnostics(value: unknown): value is RoutingDiagnostics {
 	if (!isRecord(value) || typeof value.policyVersion !== "string" || !/^\d{1,8}$/.test(value.policyVersion) ||
 		!Array.isArray(value.supportedEfforts) || value.supportedEfforts.length > 7 || !value.supportedEfforts.every(isEffort) ||
 		typeof value.taskTruncated !== "boolean" || (value.selectionMs !== undefined && !isNonnegativeNumber(value.selectionMs))) return false;
-	const context = value.compaction;
+	const context = value.context;
 	if (context === undefined) return true;
-	if (!isRecord(context) || !["bypassed", "extracting", "extracted", "failed"].includes(String(context.status)) ||
-		typeof context.candidatesTruncated !== "boolean" ||
-		!["candidateCount", "candidateCharacters", "selectedCount", "selectedCharacters"].every((key) => isNonnegativeNumber(context[key])) ||
-		(context.elapsedMs !== undefined && !isNonnegativeNumber(context.elapsedMs)) ||
-		(context.reason !== undefined && (typeof context.reason !== "string" || !/^[a-z_]{1,100}$/.test(context.reason))) ||
-		!Array.isArray(context.sources) || context.sources.length > 32 || !Array.isArray(context.ratings) || context.ratings.length > 32) return false;
-	if (context.candidateSources !== undefined && (!Array.isArray(context.candidateSources) || context.candidateSources.length > 32 ||
-		!context.candidateSources.every((source: unknown) => isContextSource(source) && typeof source.id === "string" &&
-			Object.keys(source).every((key) => ["id", "entryId", "role", "start", "end"].includes(key))))) return false;
-	return context.sources.every(isContextSource) &&
-		context.ratings.every((rating: unknown) => isRecord(rating) && typeof rating.id === "string" &&
-			["required", "useful", "background", "irrelevant"].includes(String(rating.importance)));
+	return isRecord(context) && context.strategy === "recent-turn" && typeof context.omitted === "boolean" &&
+		isNonnegativeNumber(context.characters) && Number.isSafeInteger(context.characters) &&
+		isNonnegativeNumber(context.elapsedMs) && Array.isArray(context.sources) && context.sources.length <= 2 &&
+		context.sources.every(isContextSource) &&
+		Object.keys(context).every((key) => ["strategy", "omitted", "characters", "elapsedMs", "sources"].includes(key));
 }
 
-function isContextSource(source: unknown): source is Record<string, unknown> {
+function isContextSource(source: unknown): boolean {
 	return isRecord(source) && typeof source.entryId === "string" &&
-		["user", "assistant", "summary"].includes(String(source.role)) && isNonnegativeNumber(source.start) &&
-		isNonnegativeNumber(source.end) && source.end >= source.start;
+		(source.role === "user" || source.role === "assistant") &&
+		isNonnegativeNumber(source.start) && Number.isSafeInteger(source.start) &&
+		isNonnegativeNumber(source.end) && Number.isSafeInteger(source.end) && source.end >= source.start &&
+		Object.keys(source).every((key) => ["entryId", "role", "start", "end"].includes(key));
 }
 
 function isEffort(value: unknown): value is ModelThinkingLevel {
