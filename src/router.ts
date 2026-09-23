@@ -1,4 +1,4 @@
-import { getSupportedThinkingLevels, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type AssistantMessage, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { buildContextCandidates, packContext, type ContextRating, type ContextSource } from "./context-compaction.ts";
 import { CONTEXT_INSTRUCTIONS, IMPORTANCE_CRITERIA, type ClassifyContext } from "./context-policy.ts";
 import { EFFORT_INSTRUCTIONS, EFFORT_POLICY_VERSION, getEffortCriteria } from "./effort-policy.ts";
@@ -7,6 +7,16 @@ import type { HistoryMessage } from "./session-context.ts";
 
 const MAX_REASON_LENGTH = 160;
 const MAX_TASK_CHARACTERS = 12_000;
+export const ROUTER_RESPONSE_TEXT_LIMIT = 8_192;
+
+export interface RouterResponseDiagnostics {
+	stopReason: AssistantMessage["stopReason"];
+	contentTypes: AssistantMessage["content"][number]["type"][];
+	textCharacters: number;
+	/** Opt-in text only; never includes thinking, tool arguments or provider errors. */
+	rawText?: string;
+	rawTextTruncated?: boolean;
+}
 
 export type EffortState = {
 	task: string;
@@ -168,7 +178,6 @@ export async function planEffort(input: PlanEffortInput, complete: CompleteRoute
 		});
 		input.signal.throwIfAborted();
 		const selected = parseDecision(responseText, efforts);
-		if (!selected) throw new Error("Router returned an invalid or unsupported effort");
 		return { status: "selected", plan: { model, ...selected, routerEffort } };
 	} finally {
 		diagnostics.selectionMs = elapsed(selectionStartedAt);
@@ -188,14 +197,17 @@ function parseContextRatings(text: string): ContextRating[] {
 	} catch { throw new Error("invalid_context_ratings"); }
 }
 
-function parseDecision(responseText: string, efforts: readonly ModelThinkingLevel[]): { effort: ModelThinkingLevel; reason: string } | undefined {
+function parseDecision(responseText: string, efforts: readonly ModelThinkingLevel[]): { effort: ModelThinkingLevel; reason: string } {
+	const invalid = (code: string) => new Error(`Router returned an invalid or unsupported effort (${code})`);
 	const json = extractJsonObject(responseText);
-	if (!json) return undefined;
+	if (!json) throw invalid("not_json_object");
 	let value: unknown;
-	try { value = JSON.parse(json); } catch { return undefined; }
-	if (!isRecord(value) || typeof value.effort !== "string") return undefined;
+	try { value = JSON.parse(json); } catch { throw invalid("invalid_json"); }
+	if (!isRecord(value)) throw invalid("not_json_object");
+	if (!Object.hasOwn(value, "effort")) throw invalid("missing_effort");
+	if (typeof value.effort !== "string") throw invalid("invalid_effort_type");
 	const effort = efforts.find((candidate) => candidate === value.effort);
-	if (!effort) return undefined;
+	if (!effort) throw invalid("unsupported_effort");
 	const reason = typeof value.reason === "string" ? sanitizeReason(value.reason) || "Selected by router" : "Selected by router";
 	return { effort, reason };
 }

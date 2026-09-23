@@ -70,6 +70,18 @@ describe("selection UI", () => {
 		}
 	});
 
+	it.each([
+		{ stopReason: "unknown", contentTypes: ["text"], textCharacters: 0 },
+		{ stopReason: "stop", contentTypes: ["unknown"], textCharacters: 0 },
+		{ stopReason: "stop", contentTypes: ["text"], textCharacters: -1 },
+		{ stopReason: "stop", contentTypes: ["text"], textCharacters: 9_000, rawText: "x".repeat(9_000), rawTextTruncated: false },
+		{ stopReason: "stop", contentTypes: ["text"], textCharacters: 1, rawText: "x" },
+	])("rejects malformed persisted response diagnostics %#", (response) => {
+		const saved = entry();
+		Object.assign(saved.data!, { selectorResponses: { effort: response } });
+		expect(readDecision(saved)).toBeUndefined();
+	});
+
 	it("uses primary auto and the corresponding effort color", () => {
 		const theme = createTheme();
 		expect(formatAutoEffort(theme as unknown as Theme, "high")).toBe("auto · high");

@@ -1,6 +1,6 @@
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { JevTiming, JevContextDecision } from "./jev.ts";
-import type { RoutingDiagnostics } from "./router.ts";
+import { ROUTER_RESPONSE_TEXT_LIMIT, type RouterResponseDiagnostics, type RoutingDiagnostics } from "./router.ts";
 import { keyHint, type EntryRenderer, type SessionEntry, type Theme } from "@earendil-works/pi-coding-agent";
 import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
 
@@ -26,6 +26,7 @@ export interface EffortDecision {
 	contextDecisions?: JevContextDecision[];
 	routerProbabilities?: Record<string, number>;
 	routing?: RoutingDiagnostics;
+	selectorResponses?: Partial<Record<"context" | "effort", RouterResponseDiagnostics>>;
 	selectorUsage?: Partial<Record<"context" | "effort", { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }>>;
 	elapsedMs: number;
 }
@@ -121,10 +122,23 @@ export function readDecision(entry: SessionEntry): EffortDecision | undefined {
 		(data.routerProbabilities !== undefined && (!isRecord(data.routerProbabilities) ||
 			!Object.entries(data.routerProbabilities).every(([key, value]) => isEffort(key) && isNonnegativeNumber(value) && value <= 1))) ||
 		(data.routing !== undefined && !isRoutingDiagnostics(data.routing)) ||
+		(data.selectorResponses !== undefined && (!isRecord(data.selectorResponses) || !Object.entries(data.selectorResponses).every(([key, value]) =>
+			["context", "effort"].includes(key) && isRouterResponseDiagnostics(value)))) ||
 		(data.selectorUsage !== undefined && (!isRecord(data.selectorUsage) || !Object.entries(data.selectorUsage).every(([key, value]) =>
 			["context", "effort"].includes(key) && isRecord(value) && ["input", "output", "cacheRead", "cacheWrite", "cost"].every((field) => isNonnegativeNumber(value[field]))))) ||
 		typeof data.elapsedMs !== "number" || !Number.isFinite(data.elapsedMs) || data.elapsedMs < 0) return undefined;
 	return data as unknown as EffortDecision;
+}
+
+function isRouterResponseDiagnostics(value: unknown): value is RouterResponseDiagnostics {
+	return isRecord(value) && typeof value.stopReason === "string" &&
+		["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"].includes(value.stopReason) &&
+		Array.isArray(value.contentTypes) && value.contentTypes.length <= 3 &&
+		value.contentTypes.every((type: unknown) => typeof type === "string" && ["text", "thinking", "toolCall"].includes(type)) &&
+		isNonnegativeNumber(value.textCharacters) && Number.isSafeInteger(value.textCharacters) &&
+		(value.rawText === undefined ? value.rawTextTruncated === undefined :
+			typeof value.rawText === "string" && value.rawText.length === Math.min(value.textCharacters, ROUTER_RESPONSE_TEXT_LIMIT) &&
+			value.rawTextTruncated === (value.textCharacters > ROUTER_RESPONSE_TEXT_LIMIT));
 }
 
 function isNonnegativeNumber(value: unknown): value is number {

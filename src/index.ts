@@ -9,7 +9,7 @@ import {
 	type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
 import { SettingsManager, type BeforeAgentStartEvent, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { planEffort, type CompleteRouter, type RouterInvocation, type JevBackend, type RoutingDiagnostics } from "./router.ts";
+import { planEffort, ROUTER_RESPONSE_TEXT_LIMIT, type RouterResponseDiagnostics, type CompleteRouter, type RouterInvocation, type JevBackend, type RoutingDiagnostics } from "./router.ts";
 import { JEV_MODEL, selectWithJev, classifyWithJev, type JevTiming } from "./jev.ts";
 import { collectHistory, hasContextImages } from "./session-context.ts";
 import { createSelectingWidget, DECISION_ENTRY_TYPE, formatAutoEffort, readDecision, renderDecisionEntry, type EffortDecision } from "./selection-ui.ts";
@@ -102,6 +102,8 @@ export default function piAuto(pi: ExtensionAPI): void {
 		let routerProbabilities: Record<string, number> | undefined;
 		let routing: RoutingDiagnostics | undefined;
 		const selectorUsage: NonNullable<EffortDecision["selectorUsage"]> = {};
+		const selectorResponses: NonNullable<EffortDecision["selectorResponses"]> = {};
+		const debugResponses = process.env.PI_AUTO_DEBUG === "1";
 		const interrupted = (): Pick<EffortDecision, "status" | "reason"> => controller.signal.reason === "settings_changed"
 			? { status: "kept", reason: "Model, effort or session changed during selection" }
 			: { status: "cancelled", reason: controller.signal.reason === "user_cancelled" ? "Selection cancelled by user" : "Auto disabled during selection" };
@@ -119,7 +121,9 @@ export default function piAuto(pi: ExtensionAPI): void {
 					prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
 					routerModel = modelKey(invocation.model);
 					routerEffort = invocation.effort;
-					return completeRouter(ctx, invocation, (usage) => { if (acceptingDiagnostics) selectorUsage[invocation.purpose] = usage; });
+					return completeRouter(ctx, invocation, debugResponses,
+						(usage) => { if (acceptingDiagnostics) selectorUsage[invocation.purpose] = usage; },
+						(response) => { if (acceptingDiagnostics) selectorResponses[invocation.purpose] = response; });
 				}, useJev && typesafeApiKey ? {
 					select: async (invocation) => {
 						prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
@@ -222,6 +226,7 @@ export default function piAuto(pi: ExtensionAPI): void {
 					...(routerProbabilities ? { routerProbabilities: { ...routerProbabilities } } : {}),
 					...(routing ? { routing: structuredClone(routing) } : {}),
 					...(Object.keys(selectorUsage).length ? { selectorUsage: structuredClone(selectorUsage) } : {}),
+					...(Object.keys(selectorResponses).length ? { selectorResponses: structuredClone(selectorResponses) } : {}),
 					elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
 				};
 				pi.appendEntry(DECISION_ENTRY_TYPE, lastDecision);
@@ -258,7 +263,9 @@ async function planForEvent(
 async function completeRouter(
 	ctx: ExtensionContext,
 	invocation: RouterInvocation,
+	debugResponses: boolean,
 	onUsage: (usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }) => void,
+	onResponse: (response: RouterResponseDiagnostics) => void,
 ): Promise<string> {
 	const provider = ctx.modelRegistry.getProvider(invocation.model.provider);
 	if (!provider) throw new Error(`provider is unavailable for ${modelKey(invocation.model)}`);
@@ -296,16 +303,22 @@ async function completeRouter(
 	} catch { throw new Error("router request failed"); }
 
 	onUsage({ input: response.usage.input, output: response.usage.output, cacheRead: response.usage.cacheRead, cacheWrite: response.usage.cacheWrite, cost: response.usage.cost.total });
-	if (response.stopReason === "aborted") throw new Error("router timed out");
-	if (response.stopReason === "length") throw new Error("router reached the output limit");
-	if (response.stopReason === "error") throw new Error("router request failed");
 	const text = response.content
 		.filter((part): part is { type: "text"; text: string } => part.type === "text")
 		.map((part) => part.text)
-		.join("\n")
-		.trim();
-	if (!text) throw new Error("router returned no decision");
-	return text;
+		.join("\n");
+	// Capture before validation so empty, truncated and rejected replies remain diagnosable.
+	onResponse({
+		stopReason: response.stopReason,
+		contentTypes: [...new Set(response.content.map((part) => part.type))],
+		textCharacters: text.length,
+		...(debugResponses ? { rawText: text.slice(0, ROUTER_RESPONSE_TEXT_LIMIT), rawTextTruncated: text.length > ROUTER_RESPONSE_TEXT_LIMIT } : {}),
+	});
+	if (response.stopReason === "aborted") throw new Error("router timed out");
+	if (response.stopReason === "length") throw new Error("router reached the output limit");
+	if (response.stopReason === "error") throw new Error("router request failed");
+	if (!text.trim()) throw new Error("router returned no decision");
+	return text.trim();
 }
 
 async function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {

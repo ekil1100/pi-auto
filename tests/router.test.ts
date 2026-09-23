@@ -176,6 +176,18 @@ describe("planEffort", () => {
 		await expect(planEffort(input(model), async () => response)).rejects.toThrow("invalid or unsupported effort");
 	});
 
+	it.each([
+		["plain text", "not_json_object"],
+		['{"effort":}', "invalid_json"],
+		['{"reason":"private-reason"}', "missing_effort"],
+		['{"effort":null}', "invalid_effort_type"],
+		['{"effort":"private-unknown"}', "unsupported_effort"],
+	])("explains rejected decisions without echoing their text: %s", async (response, failure) => {
+		await expect(planEffort(input(), async () => response)).rejects.toThrow(
+			`Router returned an invalid or unsupported effort (${failure})`,
+		);
+	});
+
 	it("bounds long tasks and sanitizes the displayed reason", async () => {
 		const task = `start-${"x".repeat(20_000)}-end`;
 		let routedTask = "";

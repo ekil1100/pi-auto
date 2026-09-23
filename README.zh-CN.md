@@ -65,6 +65,28 @@ Jev 使用独立的 Undici 连接池，自动读取代理环境变量，**无需
 
 浮窗展示打开时的快照。查看状态不会调用模型、重新选档或改变 effort，只展示选档元数据，不展示请求正文。RPC 客户端通过文本通知查看同一份分组信息。
 
+### 调试选择器返回
+
+当前模型的分类和选档响应会在现有会话 JSONL 的 `pi-auto-decision` 条目中记录 `selectorResponses.context` / `selectorResponses.effort`，包括停止原因、内容块类型和文本长度；已有字段仍保存模型、支持档位、耗时及用量。选档校验失败会细分为 `not_json_object`、`invalid_json`、`missing_effort`、`invalid_effort_type` 或 `unsupported_effort`，可在展开结果或 `/auto status` 中查看。
+
+默认不保存原始响应。需要捕获返回文本时，在启动终端运行：
+
+```bash
+PI_AUTO_DEBUG=1 pi
+```
+
+启用后，成功及失败响应都会额外保存 `rawText`（文本块用换行连接，保留首尾空白），每个阶段最多 **8,192 个 UTF-16 代码单元**，并用 `rawTextTruncated` 标记截断。不保存请求正文、鉴权信息、thinking 内容、工具参数或提供商错误正文。原始文本不会显示在状态界面，也不会加入主模型上下文。
+
+**返回文本可能复述任务中的敏感信息，不会自动脱敏。** 分享日志前请人工检查；排查后不带该变量重启 Pi 即可关闭，已有记录不会自动删除。此开关仅捕获当前模型响应（包括 Jev 失败后的当前模型回退），不捕获 Jev 原始 HTTP 响应。请求未返回或返回晚于超时／取消时，没有可保存的响应；旧故障也无法补录。
+
+在 Pi 的 bash 工具中可读取当前会话的记录（使用 `jq`；会输出启用调试时保存的敏感文本）：
+
+```bash
+jq 'select(.type == "custom" and .customType == "pi-auto-decision") | .data | {reason, routerModel, routerEffort, routing, selectorUsage, selectorResponses}' "$PI_SESSION_FILE"
+```
+
+普通终端中请将 `"$PI_SESSION_FILE"` 替换为实际会话文件路径；默认位于 `~/.pi/agent/sessions/` 下。仅内存会话不会写入磁盘。
+
 ## 失败回退
 
 启用 Jev 时，回退顺序为：

@@ -65,6 +65,8 @@ Default controls: **Tab** to change pages, **↑↓ / PageUp / PageDown** to scr
 
 The view is a snapshot taken when opened. Inspecting it does not call a model, rerun selection, or change effort. It shows selection metadata, not request payloads. RPC clients receive the same grouped information as a text notification.
 
+调试选择器返回：使用 `PI_AUTO_DEBUG=1 pi` 显式开启有长度上限的响应文本记录；默认只保存响应元数据。[日志字段、读取方法与隐私说明](./README.zh-CN.md#调试选择器返回)。
+
 ## Failure handling
 
 With Jev enabled, the fallback chain is:

@@ -27,6 +27,7 @@ const jevDecision: JevDecision = { effort: "high", model: JEV_MODEL, confidence:
 beforeEach(() => {
 	vi.spyOn(SettingsManager, "create").mockReturnValue(SettingsManager.inMemory({ defaultThinkingLevel: "medium" }));
 	vi.stubEnv("TYPESAFE_API_KEY", undefined);
+	vi.stubEnv("PI_AUTO_DEBUG", undefined);
 	vi.mocked(selectWithJev).mockReset().mockResolvedValue(jevDecision);
 	vi.mocked(classifyWithJev).mockReset().mockImplementation(async (_key, { candidates }) => candidates.map(({ id }) => ({ id, importance: "useful" })));
 });
@@ -1389,6 +1390,86 @@ describe("two-stage lifecycle", () => {
 		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain(`Source: ${harness.entryIds[1]}`);
 		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain("2. user | required | retained");
 		expect(restored.ctx.ui.notify.mock.lastCall?.[0]).toContain("Task truncated: true");
+	});
+
+	it.each([undefined, "0", "1"])("records response diagnostics with opt-in raw text: %s", async (debug) => {
+		vi.stubEnv("PI_AUTO_DEBUG", debug);
+		const harness = createHarness(createModel());
+		const text = '  {"effort":"unknown","reason":"private-response"}  ';
+		harness.complete.mockResolvedValueOnce(routerResponse(harness.ctx.model!, {
+			content: [{ type: "thinking", thinking: "private-thinking" }, { type: "text", text }],
+		}));
+		const before = harness.ctx.sessionManager.buildSessionContext().messages;
+		await harness.start("private-task");
+		const decision = decisions(harness)[0]!;
+		expect(decision.reason).toContain("unsupported_effort");
+		expect(decision.selectorResponses?.effort).toEqual({
+			stopReason: "stop", textCharacters: text.length,
+			contentTypes: ["thinking", "text"],
+			...(debug === "1" ? { rawText: text, rawTextTruncated: false } : {}),
+		});
+		const saved = JSON.stringify(harness.pi.appendEntry.mock.calls);
+		for (const secret of ["private-task", "private-thinking", "test-key"]) expect(saved).not.toContain(secret);
+		if (debug !== "1") expect(saved).not.toContain("private-response");
+		expect(harness.ctx.sessionManager.buildSessionContext().messages).toEqual(before);
+	});
+
+	it.each(["length", "error", "aborted"] as const)("captures bounded response text before rejecting stop reason %s", async (stopReason) => {
+		vi.stubEnv("PI_AUTO_DEBUG", "1");
+		const harness = createHarness(createModel());
+		const text = "x".repeat(9_000);
+		harness.complete.mockResolvedValueOnce(routerResponse(harness.ctx.model!, {
+			stopReason, content: [{ type: "text", text }], errorMessage: "private-provider-error",
+		}));
+		await harness.start("Task");
+		expect(decisions(harness)[0]?.selectorResponses?.effort).toEqual({
+			stopReason, textCharacters: 9_000, contentTypes: ["text"],
+			rawText: text.slice(0, 8_192), rawTextTruncated: true,
+		});
+		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).not.toContain("private-provider-error");
+	});
+
+	it("keeps context and effort replies separately without displaying raw text", async () => {
+		vi.stubEnv("PI_AUTO_DEBUG", "1");
+		const harness = twoStageHarness("model");
+		await harness.start("Task");
+		const responses = decisions(harness)[0]?.selectorResponses;
+		expect(JSON.parse(responses!.context!.rawText!)).toHaveLength(3);
+		expect(JSON.parse(responses!.effort!.rawText!)).toMatchObject({ effort: "high" });
+		await harness.command("status");
+		expect(harness.ctx.ui.notify.mock.lastCall?.[0]).not.toContain(responses!.effort!.rawText!);
+	});
+
+	it("does not attach a late response to a later decision", async () => {
+		vi.stubEnv("PI_AUTO_DEBUG", "1");
+		const deadline = new AbortController();
+		vi.spyOn(AbortSignal, "timeout").mockReturnValueOnce(deadline.signal);
+		const harness = createHarness(createModel());
+		let resolve!: (value: AssistantMessage) => void;
+		harness.complete.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+		const pending = harness.start("First task");
+		await vi.waitFor(() => expect(harness.complete).toHaveBeenCalled());
+		deadline.abort();
+		await pending;
+		await harness.start("Second task");
+		resolve(routerResponse(harness.ctx.model!, { content: [{ type: "text", text: "late-private-response" }] }));
+		await vi.advanceTimersByTimeAsync(0);
+		expect(decisions(harness)[0]?.selectorResponses).toBeUndefined();
+		expect(decisions(harness)[1]?.selectorResponses?.effort?.rawText).toContain('"effort":"high"');
+		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).not.toContain("late-private-response");
+	});
+
+	it("captures thinking-only responses without logging thinking text", async () => {
+		vi.stubEnv("PI_AUTO_DEBUG", "1");
+		const harness = createHarness(createModel());
+		harness.complete.mockResolvedValueOnce(routerResponse(harness.ctx.model!, {
+			content: [{ type: "thinking", thinking: "private-thinking" }],
+		}));
+		await harness.start("Task");
+		expect(decisions(harness)[0]?.selectorResponses?.effort).toEqual({
+			stopReason: "stop", textCharacters: 0, contentTypes: ["thinking"], rawText: "", rawTextTruncated: false,
+		});
+		expect(decisions(harness)[0]?.reason).toContain("router returned no decision");
 	});
 
 	it("does not save invalid model classification response bodies or start selection", async () => {
