@@ -110,6 +110,7 @@ function createHarness(
 		sessionManager,
 		modelRegistry: { getProvider: vi.fn(() => provider), getApiKeyAndHeaders },
 		ui: {
+			onTerminalInput: vi.fn<ExtensionContext["ui"]["onTerminalInput"]>(() => vi.fn()),
 			custom: vi.fn<ExtensionContext["ui"]["custom"]>().mockResolvedValue(undefined),
 			notify: vi.fn(),
 			setStatus: vi.fn(),
@@ -1156,6 +1157,55 @@ describe("two-stage lifecycle", () => {
 		vi.clearAllTimers();
 		vi.useRealTimers();
 		vi.restoreAllMocks();
+	});
+
+	it.each([
+		["model", "context"], ["model", "effort"], ["jev", "context"], ["jev", "effort"],
+	] as const)("cancels %s %s selection with Escape without changing effort or falling back", async (backend, phase) => {
+		const harness = twoStageHarness(backend, phase);
+		harness.ctx.mode = "tui";
+		const removeInput = vi.fn();
+		harness.ctx.ui.onTerminalInput.mockReturnValue(removeInput);
+		const pending = harness.start("Continue");
+		await vi.waitFor(() => expect(harness.phases).toContain(phase));
+		const input = harness.ctx.ui.onTerminalInput.mock.calls[0]?.[0];
+		expect(input).toBeDefined();
+		expect(input!("a")).toBeUndefined();
+		expect(harness.signals.at(-1)?.aborted).toBe(false);
+		expect(input!("\u001b")).toEqual({ consume: true });
+		await pending;
+		expect(harness.signals.at(-1)?.aborted).toBe(true);
+		expect(removeInput).toHaveBeenCalledTimes(1);
+		expect(decisions(harness)[0]).toMatchObject({ status: "cancelled", effort: "medium", reason: "Selection cancelled by user" });
+		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
+		expect(SettingsManager.create).not.toHaveBeenCalled();
+		if (backend === "jev") expect(harness.complete).not.toHaveBeenCalled();
+		harness.release();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
+		expect(decisions(harness)).toHaveLength(1);
+	});
+
+	it.each(["success", "failure", "shutdown"] as const)("removes the Escape listener after %s", async (outcome) => {
+		const harness = createHarness(createModel());
+		harness.ctx.mode = "tui";
+		const removeInput = vi.fn();
+		harness.ctx.ui.onTerminalInput.mockReturnValue(removeInput);
+		if (outcome === "failure") harness.complete.mockRejectedValueOnce(new Error("Request failed"));
+		if (outcome === "shutdown") harness.complete.mockImplementationOnce(() => new Promise(() => {}));
+		const pending = harness.start("Continue");
+		if (outcome === "shutdown") {
+			await vi.waitFor(() => expect(harness.complete).toHaveBeenCalled());
+			await harness.emit({ type: "session_shutdown", reason: "reload" });
+		}
+		await pending;
+		expect(removeInput).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not register terminal input outside TUI mode", async () => {
+		const harness = createHarness(createModel());
+		await harness.start("Continue");
+		expect(harness.ctx.ui.onTerminalInput).not.toHaveBeenCalled();
 	});
 
 	it.each(["model", "jev"] as const)("shares one 10-second budget when %s classification takes 5 seconds", async (backend) => {

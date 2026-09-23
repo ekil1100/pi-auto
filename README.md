@@ -87,6 +87,8 @@ Default effort is read from Pi's saved global and trusted-project `settings.json
 
 The level is adjusted to the model's capabilities using Pi's rules. The previous automatically selected effort is not treated as the default, and configuration files are not modified. If the relevant configuration is invalid or cannot be read, the current effort is kept and the status explains why.
 
+交互终端中，选档期间按 **Esc** 可立即取消本次选档，保留当前 effort 并继续主任务，不触发回退，也不关闭自动选择。选档结束后恢复 Esc 原有行为；非交互模式不监听 Esc。
+
 Runtime cancellation signals, `/auto off`, and changes to the model, effort, or session invalidate pending results. They do not trigger fallback or overwrite the user's new settings. Pi may not expose a cancellation signal during `before_agent_start`; use `/auto off` to cancel selection in that case.
 
 If required history exceeds the context budget, either backend can skip selection. This keeps the current effort and is not treated as a connection failure.

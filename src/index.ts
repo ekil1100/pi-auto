@@ -8,6 +8,7 @@ import {
 	type Model,
 	type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { SettingsManager, type BeforeAgentStartEvent, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { planEffort, ROUTER_RESPONSE_TEXT_LIMIT, type RouterResponseDiagnostics, type CompleteRouter, type RouterInvocation, type JevBackend, type RoutingDiagnostics } from "./router.ts";
 import { JEV_MODEL, selectWithJev, classifyWithJev, type JevTiming } from "./jev.ts";
@@ -153,8 +154,16 @@ export default function piAuto(pi: ExtensionAPI): void {
 				attempt.abort();
 			}
 		};
+		let removeTerminalInput: (() => void) | undefined;
 		ctx.ui.setWidget(PROGRESS_KEY, createSelectingWidget);
 		try {
+			if (ctx.mode === "tui") {
+				removeTerminalInput = ctx.ui.onTerminalInput((data) => {
+					if (!matchesKey(data, "escape")) return;
+					controller.abort("user_cancelled");
+					return { consume: true };
+				});
+			}
 			let result;
 			try {
 				result = await runSelection(Boolean(typesafeApiKey));
@@ -207,6 +216,7 @@ export default function piAuto(pi: ExtensionAPI): void {
 				}
 			}
 		} finally {
+			removeTerminalInput?.();
 			userSignal?.removeEventListener("abort", onUserAbort);
 			if (activeSelection === controller) activeSelection = undefined;
 			if (!stopped) {
