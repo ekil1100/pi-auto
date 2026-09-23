@@ -173,7 +173,7 @@ describe("Jev adapter", () => {
 		const data = response();
 		data.answers.effort.probabilities = { low: 0.1, medium: 0.2, high: 0.8 };
 		fetchMock.mockResolvedValueOnce(Response.json(data));
-		await expect(selectWithJev("test-key", invocation)).rejects.toThrow("probability sum");
+		await expect(selectWithJev("test-key", invocation)).rejects.toThrow("probability_sum");
 	});
 
 	it("accepts a tied highest choice and normal probability rounding", async () => {
@@ -191,13 +191,15 @@ describe("Jev adapter", () => {
 
 	it("does not retry network errors or expose their messages", async () => {
 		fetchMock.mockRejectedValueOnce(new Error("private network information"));
-		await expect(selectWithJev("test-key", invocation)).rejects.toThrow(/^Jev request failed$/);
+		const onDiagnostics = vi.fn();
+		await expect(selectWithJev("test-key", { ...invocation, onDiagnostics })).rejects.toThrow(/^Jev request failed$/);
+		expect(onDiagnostics.mock.lastCall?.[0]).toEqual({ stage: "request", errorCode: "transport_error" });
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
 	it("rejects malformed JSON without including the body in the error", async () => {
 		fetchMock.mockResolvedValueOnce(new Response("private non-JSON response", { status: 200 }));
-		await expect(selectWithJev("test-key", invocation)).rejects.toThrow(/^Jev returned an invalid decision$/);
+		await expect(selectWithJev("test-key", invocation)).rejects.toThrow(/^Jev returned an invalid decision \(invalid_envelope\)$/);
 	});
 
 	it("disables SDK body logging even when debug is configured in the environment", async () => {
@@ -229,10 +231,12 @@ describe("Jev adapter", () => {
 			fetchMock.mockImplementationOnce((_url, init) => new Promise((_resolve, reject) => {
 				init?.signal?.addEventListener("abort", () => reject(new Error("transport aborted")), { once: true });
 			}));
-			const pending = selectWithJev("test-key", invocation);
+			const onDiagnostics = vi.fn();
+			const pending = selectWithJev("test-key", { ...invocation, onDiagnostics });
 			const rejected = expect(pending).rejects.toThrow("Jev request timed out");
 			await vi.advanceTimersByTimeAsync(10_000);
 			await rejected;
+			expect(onDiagnostics.mock.lastCall?.[0]).toEqual({ stage: "request", errorCode: "request_timeout" });
 			expect(fetchMock).toHaveBeenCalledTimes(1);
 			expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
 		} finally {
@@ -245,13 +249,99 @@ describe("Jev adapter", () => {
 		fetchMock.mockImplementationOnce((_url, init) => new Promise((_resolve, reject) => {
 			init?.signal?.addEventListener("abort", () => reject(new Error("transport aborted")), { once: true });
 		}));
-		const pending = selectWithJev("test-key", { ...invocation, signal: controller.signal });
+		const onDiagnostics = vi.fn();
+		const pending = selectWithJev("test-key", { ...invocation, signal: controller.signal, onDiagnostics });
 		const rejected = expect(pending).rejects.toThrow("Jev request cancelled");
 		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
 		controller.abort();
 		await rejected;
+		expect(onDiagnostics.mock.lastCall?.[0]).toEqual({ stage: "request", errorCode: "request_cancelled" });
 		expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
 		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("Jev diagnostics", () => {
+	it.each([
+		[null, "invalid_envelope"],
+		[{}, "invalid_model"],
+		[{ ...response(), answers: null }, "invalid_answers"],
+		[{ ...response(), answers: {} }, "missing_effort"],
+		[{ ...response(), answers: { ...response().answers, extra: {} } }, "unexpected_answers"],
+		...([
+			[null, "invalid_effort_answer"],
+			[{ ...response().answers.effort, type: "text" }, "invalid_answer_type"],
+			[{ ...response().answers.effort, choice: "private-choice" }, "unsupported_effort"],
+			[{ ...response().answers.effort, confidence: "private-confidence" }, "invalid_confidence"],
+			[{ ...response().answers.effort, probabilities: null }, "invalid_probabilities"],
+			[{ ...response().answers.effort, probabilities: { low: 0.2, high: 0.8 } }, "probability_keys_mismatch"],
+			[{ ...response().answers.effort, probabilities: { low: "private-probability", medium: 0.2, high: 0.8 } }, "invalid_probability"],
+			[{ ...response().answers.effort, probabilities: { low: 0.1, medium: 0.2, high: 0.8 } }, "probability_sum"],
+			[{ ...response().answers.effort, choice: "low" }, "choice_not_max"],
+		] as const).map(([effort, code]) => [{ ...response(), answers: { effort } }, code] as const),
+	] as const)("identifies validation failure %# without logging private values", async (body, errorCode) => {
+		fetchMock.mockResolvedValueOnce(Response.json(body));
+		const onDiagnostics = vi.fn();
+		await expect(selectWithJev("test-key", { ...invocation, onDiagnostics })).rejects.toThrow(`(${errorCode})`);
+		expect(onDiagnostics.mock.lastCall?.[0]).toMatchObject({ stage: "validation", errorCode });
+		expect(onDiagnostics.mock.lastCall?.[0]).not.toHaveProperty("rawText");
+		expect(JSON.stringify(onDiagnostics.mock.calls)).not.toContain("private-");
+	});
+
+	it("records only metadata for a successful response by default", async () => {
+		const onDiagnostics = vi.fn();
+		await selectWithJev("test-key", { ...invocation, onDiagnostics });
+		expect(onDiagnostics.mock.lastCall?.[0]).toEqual({ stage: "complete", responseType: "object", responseCharacters: JSON.stringify(response()).length });
+	});
+
+	it("reports a response body read failure without exposing its contents", async () => {
+		fetchMock.mockResolvedValueOnce(new Response(new ReadableStream({
+			start(controller) { controller.error(new Error("private-body-error")); },
+		}), { status: 200 }));
+		const onDiagnostics = vi.fn();
+		await expect(selectWithJev("test-key", { ...invocation, onDiagnostics, debugResponses: true })).rejects.toThrow("Jev request failed");
+		expect(onDiagnostics.mock.lastCall?.[0]).toEqual({ stage: "response", errorCode: "response_read_failed" });
+	});
+
+	it("captures bounded response JSON only when explicitly enabled and redacts the API key", async () => {
+		const body = { ...response(), echoed: "private-key " + "x".repeat(9_000) };
+		fetchMock.mockResolvedValueOnce(Response.json(body));
+		const onDiagnostics = vi.fn();
+		await selectWithJev("private-key", { ...invocation, debugResponses: true, onDiagnostics });
+		const saved = onDiagnostics.mock.lastCall?.[0];
+		expect(saved).toMatchObject({ stage: "complete", responseType: "object", rawTextTruncated: true });
+		expect(saved.rawText).toHaveLength(8_192);
+		expect(saved.rawText).toContain("[REDACTED]");
+		expect(saved.rawText).not.toContain("private-key");
+	});
+
+	it("redacts JSON-escaped API keys from response capture", async () => {
+		const apiKey = 'private"key';
+		fetchMock.mockResolvedValueOnce(Response.json({ ...response(), echo: apiKey }));
+		const onDiagnostics = vi.fn();
+		await selectWithJev(apiKey, { ...invocation, debugResponses: true, onDiagnostics });
+		expect(onDiagnostics.mock.lastCall?.[0].rawText).toContain('"echo":"[REDACTED]"');
+		expect(onDiagnostics.mock.lastCall?.[0].rawText).not.toContain("private");
+	});
+
+	it("captures non-JSON success bodies as text for debugging", async () => {
+		fetchMock.mockResolvedValueOnce(new Response("not JSON", { status: 200 }));
+		const onDiagnostics = vi.fn();
+		await expect(selectWithJev("test-key", { ...invocation, debugResponses: true, onDiagnostics })).rejects.toThrow("invalid_envelope");
+		expect(onDiagnostics.mock.lastCall?.[0]).toMatchObject({ responseType: "string", rawText: "not JSON", rawTextTruncated: false });
+	});
+
+	it("does not capture HTTP error bodies or arbitrary provider messages even in debug mode", async () => {
+		fetchMock.mockResolvedValueOnce(Response.json({ message: "private-body test-key" }, { status: 429 }));
+		const onDiagnostics = vi.fn();
+		await expect(selectWithJev("test-key", { ...invocation, debugResponses: true, onDiagnostics })).rejects.toThrow("HTTP 429");
+		expect(onDiagnostics.mock.lastCall?.[0]).toMatchObject({ stage: "response", errorCode: "http_error" });
+		expect(onDiagnostics.mock.lastCall?.[0]).not.toHaveProperty("rawText");
+		expect(JSON.stringify(onDiagnostics.mock.calls)).not.toMatch(/private-body|test-key/);
+	});
+
+	it("isolates observer mutation and failure from selection", async () => {
+		await expect(selectWithJev("test-key", { ...invocation, onDiagnostics: () => { throw new Error("Observer failed"); } })).resolves.toMatchObject({ effort: "high" });
 	});
 });
 

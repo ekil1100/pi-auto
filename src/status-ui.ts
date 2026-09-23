@@ -62,6 +62,38 @@ export function buildStatusPages(state: AutoStatus): StatusPage[] {
 	const diagnostics: StatusLine[] = [row("Current capabilities", "accent"), row(`Supported efforts: ${state.supportedEfforts.join(", ") || "none"}`)];
 	if (!last) diagnostics.push(row("No selection diagnostics recorded.", "dim"));
 	else {
+		diagnostics.push(...section("Selection attempts"));
+		if (!last.selectorAttempts?.length) diagnostics.push(row("Attempt trace not recorded.", "dim"));
+		for (const [index, attempt] of (last.selectorAttempts ?? []).entries()) {
+			diagnostics.push(row(`${index + 1}. ${attempt.backend}: ${attempt.outcome}`),
+				row(`Elapsed: ${attempt.elapsedMs}ms | Deadline: ${attempt.timeoutMs}ms`));
+			if (attempt.interruption) diagnostics.push(row(`Interruption source: ${attempt.interruption}`, "warning"));
+			if (attempt.reason) diagnostics.push(row(`Detail: ${attempt.reason}`));
+		}
+		if (last.jevDiagnostics || last.jevTiming) {
+			diagnostics.push(...section("Jev response"));
+			const jev = last.jevDiagnostics;
+			if (!jev) diagnostics.push(row("Jev response diagnostics not recorded.", "dim"));
+			else {
+				diagnostics.push(row(`Stage: ${jev.stage}`));
+				if (jev.errorCode) diagnostics.push(row(`Error code: ${jev.errorCode}`, "warning"));
+				if (jev.responseType !== undefined) {
+					diagnostics.push(row(`Decoded type: ${jev.responseType}`), row(`Response text: ${jev.responseCharacters} UTF-16 units`));
+					if (jev.rawText !== undefined) diagnostics.push(row(`Response capture saved: ${jev.rawText.length} UTF-16 units | truncated: ${jev.rawTextTruncated ? "yes" : "no"}`),
+						row("Read jevDiagnostics.rawText in the session JSONL pi-auto-decision entry. Decoded JSON/text may contain sensitive data.", "warning"));
+					else diagnostics.push(row("Response body not captured. Restart with PI_AUTO_DEBUG=1 to capture future successful HTTP response bodies.", "dim"));
+				} else diagnostics.push(row("No decoded successful response recorded. HTTP error bodies are never saved.", "dim"));
+			}
+		}
+		diagnostics.push(...section("Current-model response"));
+		const response = last.selectorResponses?.effort;
+		if (response) {
+			diagnostics.push(row(`Stop reason: ${response.stopReason}`), row(`Content types: ${response.contentTypes.join(", ") || "none"}`),
+				row(`Response text: ${response.textCharacters} UTF-16 units`));
+			if (response.rawText !== undefined) diagnostics.push(row(`Raw response saved: ${response.rawText.length} UTF-16 units | truncated: ${response.rawTextTruncated ? "yes" : "no"}`),
+				row("Read selectorResponses.effort.rawText in the session JSONL pi-auto-decision entry. It may contain sensitive text.", "warning"));
+			else diagnostics.push(row("Raw response not captured. Restart with PI_AUTO_DEBUG=1 to capture future responses.", "dim"));
+		} else diagnostics.push(row("No current-model response recorded (not called, no response before interruption, or older record).", "dim"));
 		diagnostics.push(...section("Last selection policy"));
 		if (last.routerEffort) diagnostics.push(row(`Selector effort: ${last.routerEffort}`));
 		if (last.routing) diagnostics.push(row(`Policy: ${last.routing.policyVersion}`),

@@ -119,6 +119,51 @@ describe("status information hierarchy", () => {
 		for (const value of ["low: 0.1", "high: 0.8", "not task success probability", "not included in Pi footer", "unknown input / 1 output"]) expect(page).toContain(value);
 	});
 
+	it("shows current-model response metadata and explains missing raw logs", () => {
+		const last = decision();
+		last.routerModel = "test/current";
+		last.status = "kept";
+		last.reason = "Router returned an invalid or unsupported effort (not_json_object)";
+		last.selectorResponses = { effort: { stopReason: "stop", textCharacters: 19, contentTypes: ["text"] } };
+		const page = text(status(last), 2);
+		expect(page).toContain("Stop reason: stop");
+		expect(page).toContain("Response text: 19 UTF-16 units");
+		expect(page).toContain("Content types: text");
+		expect(page).toContain("PI_AUTO_DEBUG=1");
+	});
+
+	it("shows per-attempt deadlines and interruption sources after fallback", () => {
+		const last = decision();
+		last.selectorAttempts = [
+			{ backend: "jev", outcome: "failed", interruption: "deadline", timeoutMs: 10_000, elapsedMs: 10_000, reason: "router timed out" },
+			{ backend: "current-model", outcome: "failed", interruption: "provider", timeoutMs: 10_000, elapsedMs: 12, reason: "router provider aborted the request" },
+		];
+		const page = text(status(last), 2);
+		for (const value of ["1. jev: failed", "2. current-model: failed", "Interruption source: deadline", "Interruption source: provider", "Elapsed: 12ms | Deadline: 10000ms"]) expect(page).toContain(value);
+	});
+
+	it("locates opt-in raw logs without displaying private response text", () => {
+		const last = decision();
+		last.selectorResponses = { effort: { stopReason: "stop", contentTypes: ["text"], textCharacters: 14, rawText: "private-output", rawTextTruncated: false } };
+		const page = text(status(last), 2);
+		expect(page).toContain("Raw response saved: 14 UTF-16 units | truncated: no");
+		expect(page).toContain("selectorResponses.effort.rawText");
+		expect(page).not.toContain("private-output");
+	});
+
+	it("validates attempt traces when restoring a saved decision", () => {
+		const last = decision();
+		const attempt = { backend: "current-model" as const, outcome: "cancelled" as const, interruption: "escape" as const, timeoutMs: 10_000, elapsedMs: 4 };
+		last.selectorAttempts = [attempt];
+		const entry = { type: "custom" as const, customType: DECISION_ENTRY_TYPE, id: "decision", parentId: null, timestamp: "2026-01-01", data: last };
+		expect(readDecision(JSON.parse(JSON.stringify(entry)))).toEqual(last);
+		for (const attempts of [null, {}, [attempt, attempt, attempt], [{ ...attempt, backend: "unknown" }], [{ ...attempt, interruption: "unknown" }], [{ ...attempt, timeoutMs: -1 }], [{ ...attempt, elapsedMs: NaN }]]) {
+			const bad = structuredClone(entry);
+			Object.assign(bad.data, { selectorAttempts: attempts });
+			expect(readDecision(bad)).toBeUndefined();
+		}
+	});
+
 	it("round trips bounded metadata without storing message text or dependencies", () => {
 		const last = decision();
 		const entry = { type: "custom" as const, customType: DECISION_ENTRY_TYPE, id: "decision", parentId: null, timestamp: "2026-01-01", data: last };

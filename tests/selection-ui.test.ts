@@ -82,6 +82,31 @@ describe("selection UI", () => {
 		expect(readDecision(saved)).toBeUndefined();
 	});
 
+	it("round trips Jev diagnostics and exposes the error code without raw text", () => {
+		const saved = entry({ jevDiagnostics: { stage: "validation", errorCode: "invalid_model", responseType: "string",
+			responseCharacters: 7, rawText: "private", rawTextTruncated: false } });
+		const restored = readDecision(JSON.parse(JSON.stringify(saved)))!;
+		expect(restored.jevDiagnostics).toEqual(saved.data!.jevDiagnostics);
+		expect(diagnostics(restored)).toContain("Stage: validation");
+		expect(diagnostics(restored)).toContain("Error code: invalid_model");
+		expect(diagnostics(restored)).toContain("jevDiagnostics.rawText");
+		expect(diagnostics(restored)).not.toContain("private");
+		expect(render(true, restored).lines.join("\n")).not.toContain("private");
+	});
+
+	it.each([
+		null, {}, { stage: "unknown" }, { stage: "validation", errorCode: "private-error" },
+		{ stage: "response", headers: { Authorization: "private" } },
+		{ stage: "validation", responseType: "object" },
+		{ stage: "validation", responseType: "object", responseCharacters: -1 },
+		{ stage: "validation", responseType: "object", responseCharacters: 2, rawText: "{}" },
+		{ stage: "validation", responseType: "object", responseCharacters: 9_000, rawText: "x".repeat(9_000), rawTextTruncated: false },
+	])("rejects malformed Jev diagnostics %#", (jevDiagnostics) => {
+		const saved = entry();
+		Object.assign(saved.data!, { jevDiagnostics });
+		expect(readDecision(saved)).toBeUndefined();
+	});
+
 	it("uses primary auto and the corresponding effort color", () => {
 		const theme = createTheme();
 		expect(formatAutoEffort(theme as unknown as Theme, "high")).toBe("auto · high");
@@ -102,6 +127,26 @@ describe("selection UI", () => {
 		expect(text).not.toContain("test/current");
 	});
 
+	it.each([
+		["openai-codex/gpt-6-astra", "gpt-6-astra"],
+		["typesafe/jev-1.13.0", "jev-1.13.0"],
+	])("shows the actual selector %s in the collapsed heading", (routerModel, label) => {
+		const { lines } = render(false, { effort: "high", routerModel });
+		expect(lines.join("\n")).toContain(`auto · high · ${label} · 1.20s`);
+		expect(lines.join("\n")).toContain("ctrl+o");
+	});
+
+	it.each([[0, "0.00s"], [530, "0.53s"], [12_345, "12.35s"]] as const)("shows %i milliseconds as total selection time", (elapsedMs, label) => {
+		const { lines } = render(false, { routerModel: "typesafe/jev-1.13.0", elapsedMs, jevTiming: { totalMs: 100 } });
+		expect(lines.join("\n")).toContain(`jev-1.13.0 · ${label} ctrl+o`);
+	});
+
+	it("labels the actual current-model selector after Jev fallback", () => {
+		const { lines } = render(false, { routerModel: "openai-codex/gpt-6-astra", reason: "Jev failed; current-model fallback", jevDiagnostics: { stage: "validation", errorCode: "missing_effort" } });
+		expect(lines.join("\n")).toContain("auto · low · gpt-6-astra · 1.20s");
+		expect(lines.join("\n")).not.toContain("jev-1.13.0");
+	});
+
 	it("shows a concise decision summary when Pi expands the entry", () => {
 		const { lines, theme } = render(true);
 		const text = lines.join("\n");
@@ -118,7 +163,7 @@ describe("selection UI", () => {
 
 	it.each(["kept", "cancelled"] as const)("keeps the %s outcome visible while hiding details", (status) => {
 		const { lines, theme } = render(false, { status });
-		expect(lines.join("\n")).toContain(`auto · low · ${status}`);
+		expect(lines.join("\n")).toContain(`auto · low · current · 1.20s · ${status}`);
 		expect(theme.fg).toHaveBeenCalledWith("warning", ` · ${status}`);
 		expect(lines.join("\n")).not.toContain("Reason:");
 	});

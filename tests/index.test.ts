@@ -1,10 +1,12 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, AssistantMessage, Context, ImageContent, Model, ModelThinkingLevel, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentSystemPrompt, InMemoryCredentialStore, type Api, type AssistantMessage, type Context, type ImageContent, type Model, type ModelThinkingLevel, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import {
 	SessionManager,
 	SettingsManager,
+	ModelRegistry,
+	ModelRuntime,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
@@ -91,6 +93,9 @@ function createHarness(
 			result: () => complete(model, context, options),
 		})),
 	};
+	const streamSimple = vi.fn((model: Model<Api>, context: Context, options?: SimpleStreamOptions) => ({
+		result: () => complete(model, context, options),
+	}));
 	const getApiKeyAndHeaders = vi.fn<ExtensionContext["modelRegistry"]["getApiKeyAndHeaders"]>(async () => ({
 		ok: true, apiKey: "test-key",
 	}));
@@ -111,7 +116,7 @@ function createHarness(
 		get thinkingLevel() { return activeEffort; },
 		scopedModels,
 		sessionManager,
-		modelRegistry: { getProvider: vi.fn(() => provider), getApiKeyAndHeaders },
+		modelRegistry: { streamSimple, getProvider: vi.fn(() => provider), getApiKeyAndHeaders },
 		ui: {
 			onTerminalInput: vi.fn<ExtensionContext["ui"]["onTerminalInput"]>(() => vi.fn()),
 			custom: vi.fn<ExtensionContext["ui"]["custom"]>().mockResolvedValue(undefined),
@@ -137,6 +142,7 @@ function createHarness(
 		ctx,
 		complete,
 		provider,
+		streamSimple,
 		getApiKeyAndHeaders,
 		async command(args: string) {
 			const command = pi.registerCommand.mock.calls.find(([name]) => name === "auto")?.[1];
@@ -149,19 +155,46 @@ function createHarness(
 				prompt,
 				...(images ? { images } : {}),
 				systemPrompt: "Test system prompt",
-				systemPromptOptions: { cwd: process.cwd() },
+				systemPromptOptions: {
+					cwd: process.cwd(), selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [],
+					appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [],
+				},
 			});
 		},
 	};
 }
 
+describe("command completions", () => {
+	it.each([
+		["", ["toggle", "on", "off", "status", "default on", "default off"]],
+		["o", ["on", "off"]],
+		["st", ["status"]],
+		["d", ["default on", "default off"]],
+		["default ", ["default on", "default off"]],
+		["default of", ["default off"]],
+		[" DEFAULT   O", ["default on", "default off"]],
+		["unknown", []],
+		["default off extra", []],
+	] as const)("completes argument prefix %j", async (prefix, expected) => {
+		const harness = createHarness(createModel());
+		const command = harness.pi.registerCommand.mock.calls.find(([name]) => name === "auto")![1];
+		expect(command.getArgumentCompletions).toBeTypeOf("function");
+		const result = await command.getArgumentCompletions!(prefix);
+		expect(result).toEqual(expected.length ? expected.map((value) => ({ value, label: value })) : null);
+		expect(harness.complete).not.toHaveBeenCalled();
+		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
+		await expect(readFile(join(agentDirectory, "pi-auto.json"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
 describe("startup defaults", () => {
-	it("persists off across instances without changing the current instance", async () => {
+	it("persists off across instances and disables the current instance", async () => {
 		const current = createHarness(createModel());
 		await current.command("default off");
 		expect(JSON.parse(await readFile(join(agentDirectory, "pi-auto.json"), "utf8"))).toEqual({ defaultEnabled: false });
-		await current.start("Current instance stays enabled");
-		expect(current.complete).toHaveBeenCalledTimes(1);
+		await current.start("Current instance is disabled");
+		expect(current.complete).not.toHaveBeenCalled();
+		expect(current.ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-auto", undefined);
 		const restarted = createHarness(createModel());
 		await restarted.emit({ type: "session_start", reason: "startup" });
 		await restarted.start("Disabled after restart");
@@ -172,12 +205,13 @@ describe("startup defaults", () => {
 		expect(JSON.parse(await readFile(join(agentDirectory, "pi-auto.json"), "utf8"))).toEqual({ defaultEnabled: false });
 	});
 
-	it("persists on without enabling the current disabled instance", async () => {
+	it("persists on and enables the current disabled instance", async () => {
 		await writeFile(join(agentDirectory, "pi-auto.json"), '{"defaultEnabled":false}');
 		const current = createHarness(createModel());
 		await current.command(" DEFAULT   ON ");
-		await current.start("Still disabled");
-		expect(current.complete).not.toHaveBeenCalled();
+		expect(current.ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-auto", "auto · medium");
+		await current.start("Enabled immediately");
+		expect(current.complete).toHaveBeenCalledTimes(1);
 		const restarted = createHarness(createModel());
 		await restarted.start("Enabled after reload");
 		expect(restarted.complete).toHaveBeenCalledTimes(1);
@@ -205,6 +239,36 @@ describe("startup defaults", () => {
 		const restarted = createHarness(createModel());
 		await restarted.start("Recovered");
 		expect(restarted.complete).toHaveBeenCalledTimes(1);
+	});
+
+	it.each(["model", "jev", "fallback"] as const)("default off cancels pending %s selection without applying late results", async (backend) => {
+		if (backend !== "model") vi.stubEnv("TYPESAFE_API_KEY", "test-key");
+		const model = createModel();
+		const harness = createHarness(model);
+		let release!: () => void;
+		if (backend === "jev") vi.mocked(selectWithJev).mockImplementationOnce(() => new Promise((resolve) => {
+			release = () => resolve(jevDecision);
+		}));
+		else {
+			if (backend === "fallback") vi.mocked(selectWithJev).mockRejectedValueOnce(new Error("Jev request failed"));
+			harness.complete.mockImplementationOnce(() => new Promise((resolve) => {
+				release = () => resolve(routerResponse(model));
+			}));
+		}
+		const pending = harness.start("Continue");
+		await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+		await harness.command("default off");
+		await pending;
+		expect(decisions(harness)[0]?.selectorAttempts?.at(-1)).toMatchObject({ outcome: "cancelled", interruption: "auto-off" });
+		expect(harness.ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-auto", undefined);
+		expect(JSON.parse(await readFile(join(agentDirectory, "pi-auto.json"), "utf8"))).toEqual({ defaultEnabled: false });
+		release();
+		await Promise.resolve();
+		await harness.start("Still disabled");
+		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
+		expect(harness.complete).toHaveBeenCalledTimes(backend === "jev" ? 0 : 1);
+		expect(selectWithJev).toHaveBeenCalledTimes(backend === "model" ? 0 : 1);
+		expect(decisions(harness)).toHaveLength(1);
 	});
 
 	it("reports save failures without changing the current state", async () => {
@@ -284,7 +348,7 @@ describe("Jev lifecycle", () => {
 		const status = harness.ctx.ui.notify.mock.lastCall?.[0];
 		expect(status).toContain(`Selector: typesafe/${JEV_MODEL}`);
 		expect(status).toContain("Confidence: 0.850 (not success probability)");
-		expect(status).not.toContain("not called");
+		expect(status).not.toContain("Selector: not called");
 		expect(JSON.stringify(decisions(harness))).not.toContain(key);
 		expect(harness.ctx.sessionManager.buildSessionContext().messages).toHaveLength(1);
 	});
@@ -367,6 +431,51 @@ describe("Jev lifecycle", () => {
 		expect(harness.ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-auto-selecting", undefined);
 	});
 
+	it.each([false, true])("retains Jev diagnostics across current-model fallback with debug=%j", async (debug) => {
+		vi.stubEnv("TYPESAFE_API_KEY", "test-key");
+		vi.stubEnv("PI_AUTO_DEBUG", debug ? "1" : undefined);
+		const harness = createHarness(createModel());
+		vi.mocked(selectWithJev).mockImplementationOnce(async (_key, invocation) => {
+			expect(invocation.debugResponses).toBe(debug);
+			invocation.onDiagnostics?.({ stage: "validation", errorCode: "missing_effort", responseType: "object", responseCharacters: 2,
+				...(debug ? { rawText: "{}", rawTextTruncated: false } : {}),
+			});
+			throw new Error("Jev returned an invalid decision (missing_effort)");
+		});
+		await harness.start("Continue");
+		const saved = decisions(harness)[0]!;
+		expect(saved).toMatchObject({ status: "selected", routerModel: "test/current", jevDiagnostics: { stage: "validation", errorCode: "missing_effort" } });
+		expect(saved.jevDiagnostics?.rawText).toBe(debug ? "{}" : undefined);
+		await harness.command("status");
+		expect(harness.ctx.ui.notify.mock.lastCall?.[0]).toContain("Error code: missing_effort");
+		expect(harness.complete).toHaveBeenCalledTimes(1);
+	});
+
+	it("freezes Jev diagnostic snapshots before cancellation and late callbacks", async () => {
+		vi.stubEnv("TYPESAFE_API_KEY", "test-key");
+		const harness = createHarness(createModel());
+		let report!: NonNullable<Parameters<typeof selectWithJev>[1]["onDiagnostics"]>;
+		let release!: () => void;
+		vi.mocked(selectWithJev).mockImplementationOnce((_key, invocation) => new Promise((resolve) => {
+			report = invocation.onDiagnostics!;
+			const snapshot = { stage: "response" as const };
+			report(snapshot);
+			Object.assign(snapshot, { errorCode: "transport_error" });
+			release = () => resolve(jevDecision);
+		}));
+		const pending = harness.start("Continue");
+		await vi.waitFor(() => expect(report).toBeTypeOf("function"));
+		await harness.command("off");
+		await pending;
+		expect(decisions(harness)[0]?.jevDiagnostics).toEqual({ stage: "response" });
+		const before = JSON.stringify(harness.pi.appendEntry.mock.calls);
+		report({ stage: "complete", responseType: "string", responseCharacters: 7, rawText: "private", rawTextTruncated: false });
+		release();
+		await Promise.resolve();
+		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).toBe(before);
+		expect(harness.complete).not.toHaveBeenCalled();
+	});
+
 	it("uses a fresh fallback deadline after a Jev timeout and ignores a late result", async () => {
 		vi.stubEnv("TYPESAFE_API_KEY", "test-typesafe-key");
 		const controller = new AbortController();
@@ -391,6 +500,11 @@ describe("Jev lifecycle", () => {
 			expect(harness.complete.mock.calls[0]?.[2]?.signal).not.toBe(vi.mocked(selectWithJev).mock.calls[0]?.[1].signal);
 			expect(decisions(harness)).toEqual([expect.objectContaining({ status: "selected", reason: "Jev failed (router timed out); current-model fallback: Best fit" })]);
 			expect(decisions(harness)[0]?.routerConfidence).toBeUndefined();
+			expect(decisions(harness)[0]?.selectorAttempts).toEqual([
+				expect.objectContaining({ backend: "jev", outcome: "failed", interruption: "deadline", timeoutMs: 10_000 }),
+				expect.objectContaining({ backend: "current-model", outcome: "selected" }),
+			]);
+			expect(decisions(harness)[0]?.selectorAttempts?.[1]).not.toHaveProperty("interruption");
 		} finally {
 			timeout.mockRestore();
 		}
@@ -553,7 +667,9 @@ describe("configured default fallback", () => {
 		await pending;
 		fail(new Error("late failure"));
 		await Promise.resolve();
-		expect(decisions(harness)[0]).toMatchObject({ status: "cancelled", reason: "Selection cancelled by user" });
+		expect(decisions(harness)[0]).toMatchObject({ status: "cancelled", reason: "Selection cancelled by runtime" });
+		expect(decisions(harness)[0]?.selectorAttempts?.at(-1)).toMatchObject({ outcome: "cancelled", interruption: "runtime" });
+		expect(JSON.stringify(decisions(harness))).not.toContain("private-cancellation-reason");
 		expect(SettingsManager.create).not.toHaveBeenCalled();
 		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
 		expect(harness.complete).toHaveBeenCalledTimes(phase === "jev" ? 0 : 1);
@@ -774,19 +890,35 @@ describe("pi-auto lifecycle", () => {
 		expect(harness.pi.setModel).not.toHaveBeenCalled();
 	});
 
-	it("passes resolved authentication, headers, base URL and environment to the provider", async () => {
+	it("uses Pi's runtime to preserve instructions and resolve provider authentication", async () => {
 		const model = createModel();
 		const harness = createHarness(model);
-		const headers = { "x-custom-auth": "test-token" };
-		const env = { TEST_PROVIDER_REGION: "test-region" };
-		harness.getApiKeyAndHeaders.mockResolvedValueOnce({ ok: true, apiKey: "resolved-key", headers, env, baseUrl: "https://proxy.test" });
+		const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, refreshOnCreate: false });
+		const registry = new ModelRegistry(runtime);
+		let systemPrompt: string | undefined;
+		let requestOptions: SimpleStreamOptions | undefined;
+		registry.registerProvider("test", {
+			api: model.api, apiKey: "synthetic-key", baseUrl: "https://example.test",
+			streamSimple: (_model, context, options) => {
+				systemPrompt = getCurrentSystemPrompt(context.messages);
+				requestOptions = options;
+				const stream = createAssistantMessageEventStream();
+				const response = routerResponse(model, { content: [{ type: "text", text: systemPrompt?.includes('"effort"') ? '{"effort":"high"}' : "Missing instructions" }] });
+				stream.push({ type: "done", reason: "stop", message: response });
+				stream.end();
+				return stream;
+			},
+		});
+		harness.streamSimple.mockImplementation((...args) => registry.streamSimple(...args));
 
 		await harness.start("Continue");
 
-		expect(harness.getApiKeyAndHeaders).toHaveBeenCalledWith(model);
-		expect(harness.complete.mock.calls[0]?.[0].baseUrl).toBe("https://proxy.test");
-		expect(harness.complete.mock.calls[0]?.[2]).toMatchObject({ apiKey: "resolved-key", headers, env, cacheRetention: "none" });
-		expect(harness.ctx.model).toBe(model);
+		expect(harness.streamSimple).toHaveBeenCalledTimes(1);
+		expect(harness.ctx.modelRegistry.getProvider).not.toHaveBeenCalled();
+		expect(harness.getApiKeyAndHeaders).not.toHaveBeenCalled();
+		expect(systemPrompt).toContain('"effort"');
+		expect(requestOptions).toMatchObject({ apiKey: "synthetic-key", cacheRetention: "none", maxRetries: 0 });
+		expect(decisions(harness)[0]).toMatchObject({ status: "selected", effort: "high" });
 	});
 
 	it.each([
@@ -1027,6 +1159,18 @@ describe("pi-auto lifecycle", () => {
 		expect(requestPayload(harness).hasImages).toBe(false);
 	});
 
+	it("does not mislabel a provider abort as a local timeout", async () => {
+		const current = createModel();
+		const harness = createHarness(current);
+		harness.complete.mockResolvedValueOnce(routerResponse(current, { stopReason: "aborted" }));
+		await harness.start("Continue");
+		expect(decisions(harness)[0]?.reason).toContain("provider aborted");
+		expect(decisions(harness)[0]?.reason).not.toContain("timed out");
+		expect(decisions(harness)[0]?.selectorAttempts).toEqual([
+			expect.objectContaining({ backend: "current-model", outcome: "failed", interruption: "provider" }),
+		]);
+	});
+
 	it.each(["length", "aborted", "error"] as const)("preserves model and effort on a %s response even if JSON parses", async (stopReason) => {
 		const current = createModel();
 		const harness = createHarness(current);
@@ -1055,26 +1199,24 @@ describe("pi-auto lifecycle", () => {
 		expect(harness.pi.setModel).not.toHaveBeenCalled();
 	});
 
-	it("keeps the effort when authentication is unavailable", async () => {
+	it("keeps the effort when the runtime cannot authenticate", async () => {
 		const harness = createHarness(createModel());
-		harness.getApiKeyAndHeaders.mockResolvedValueOnce({ ok: false, error: "No API key" });
+		harness.streamSimple.mockImplementationOnce(() => { throw new Error("No API key"); });
 
 		await harness.start("Continue");
 
 		expect(harness.ctx.thinkingLevel).toBe("medium");
 		expect(harness.complete).not.toHaveBeenCalled();
-		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: "router authentication failed; restored Pi default effort (medium)" });
+		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: "router request failed; restored Pi default effort (medium)" });
 	});
 
-	it.each(["auth-result", "auth-rejection", "provider-sync", "provider-rejection"])("never persists echoed credentials from %s", async (failure) => {
+	it.each(["runtime-sync", "runtime-rejection"])("never persists echoed credentials from %s", async (failure) => {
 		const harness = createHarness(createModel());
 		const privateBody = "HTTP 400 private-body api_key=secret-canary";
-		if (failure === "auth-result") harness.getApiKeyAndHeaders.mockResolvedValueOnce({ ok: false, error: privateBody });
-		if (failure === "auth-rejection") harness.getApiKeyAndHeaders.mockRejectedValueOnce(new Error(privateBody));
-		if (failure === "provider-sync") harness.provider.streamSimple.mockImplementationOnce(() => { throw new Error(privateBody); });
-		if (failure === "provider-rejection") harness.complete.mockRejectedValueOnce(new Error(privateBody));
+		if (failure === "runtime-sync") harness.streamSimple.mockImplementationOnce(() => { throw new Error(privateBody); });
+		if (failure === "runtime-rejection") harness.complete.mockRejectedValueOnce(new Error(privateBody));
 		await harness.start("Continue");
-		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: `${failure.startsWith("auth") ? "router authentication failed" : "router request failed"}; restored Pi default effort (medium)` });
+		expect(decisions(harness)[0]).toMatchObject({ status: "kept", reason: "router request failed; restored Pi default effort (medium)" });
 		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).not.toContain("secret-canary");
 		expect(JSON.stringify(harness.pi.appendEntry.mock.calls)).not.toContain("private-body");
 	});
@@ -1100,25 +1242,27 @@ describe("pi-auto lifecycle", () => {
 			expect(harness.ctx.thinkingLevel).toBe("medium");
 			expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
 			expect(decisions(harness)).toEqual([expect.objectContaining({ status: "kept", reason: "router timed out; restored Pi default effort (medium)" })]);
+			expect(decisions(harness)[0]?.selectorAttempts).toEqual([
+				expect.objectContaining({ backend: "current-model", outcome: "failed", interruption: "deadline", timeoutMs: 10_000 }),
+			]);
 			expect(harness.ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-auto-selecting", undefined);
 		} finally {
 			timeout.mockRestore();
 		}
 	});
 
-	it("does not start a request after authentication outlives the timeout", async () => {
+	it("passes the abort signal to the runtime while it prepares a request", async () => {
 		const controller = new AbortController();
 		const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
 		try {
 			const harness = createHarness(createModel());
-			let resolve!: (value: { ok: true; apiKey: string }) => void;
-			harness.getApiKeyAndHeaders.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+			harness.streamSimple.mockImplementationOnce(() => ({ result: () => new Promise(() => {}) }));
 
 			const pending = harness.start("Continue");
+			expect(harness.streamSimple).toHaveBeenCalledTimes(1);
 			controller.abort();
 			await pending;
-			resolve({ ok: true, apiKey: "test-key" });
-			await Promise.resolve();
+			expect(harness.streamSimple.mock.calls[0]?.[2]?.signal?.aborted).toBe(true);
 
 			expect(harness.complete).not.toHaveBeenCalled();
 			expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
@@ -1357,6 +1501,7 @@ describe("history routing lifecycle", () => {
 		expect(harness.signals.at(-1)?.aborted).toBe(true);
 		expect(removeInput).toHaveBeenCalledTimes(1);
 		expect(decisions(harness)[0]).toMatchObject({ status: "cancelled", effort: "medium", reason: "Selection cancelled by user" });
+		expect(decisions(harness)[0]?.selectorAttempts?.at(-1)).toMatchObject({ outcome: "cancelled", interruption: "escape" });
 		expect(harness.pi.setThinkingLevel).not.toHaveBeenCalled();
 		expect(SettingsManager.create).not.toHaveBeenCalled();
 		expect(harness.complete).toHaveBeenCalledTimes(backend === "jev" ? 0 : 1);
@@ -1458,6 +1603,7 @@ describe("history routing lifecycle", () => {
 			else expect(decisions(harness)).toEqual([expect.objectContaining({
 				status: change === "off-on" ? "cancelled" : "kept",
 				reason: change === "off-on" ? "Auto disabled during selection" : "Model, effort or session changed during selection",
+				selectorAttempts: expect.arrayContaining([expect.objectContaining({ outcome: "cancelled", interruption: change === "off-on" ? "auto-off" : "settings-changed" })]),
 			})]);
 			const saved = JSON.stringify(harness.pi.appendEntry.mock.calls);
 			harness.release();

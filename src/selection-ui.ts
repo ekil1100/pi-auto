@@ -1,5 +1,5 @@
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import type { JevTiming } from "./jev.ts";
+import { JEV_ERROR_CODES, JEV_RESPONSE_TEXT_LIMIT, type JevDiagnostics, type JevTiming } from "./jev.ts";
 import { ROUTER_RESPONSE_TEXT_LIMIT, type RouterResponseDiagnostics, type RoutingDiagnostics } from "./router.ts";
 import { keyHint, type EntryRenderer, type SessionEntry, type Theme } from "@earendil-works/pi-coding-agent";
 import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
@@ -10,6 +10,15 @@ const SELECTING_LABEL = "choosing effort";
 /** Same Braille frames and cadence as Pi's built-in loader. */
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS = 80;
+
+export interface SelectionAttempt {
+	backend: "jev" | "current-model";
+	outcome: "selected" | "skipped" | "failed" | "cancelled";
+	timeoutMs: number;
+	elapsedMs: number;
+	interruption?: "deadline" | "escape" | "runtime" | "auto-off" | "settings-changed" | "session-shutdown" | "provider";
+	reason?: string;
+}
 
 export interface EffortDecision {
 	status: "selected" | "kept" | "cancelled";
@@ -22,8 +31,10 @@ export interface EffortDecision {
 	routerConfidence?: number;
 	prepareMs?: number;
 	jevTiming?: JevTiming;
+	jevDiagnostics?: JevDiagnostics;
 	routerProbabilities?: Record<string, number>;
 	routing?: RoutingDiagnostics;
+	selectorAttempts?: SelectionAttempt[];
 	selectorResponses?: Partial<Record<"effort", RouterResponseDiagnostics>>;
 	selectorUsage?: Partial<Record<"effort", { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }>>;
 	elapsedMs: number;
@@ -69,6 +80,11 @@ export const renderDecisionEntry: EntryRenderer<EffortDecision> = (entry, { expa
 	if (!decision) return undefined;
 
 	let heading = formatAutoEffort(theme, decision.effort);
+	if (decision.routerModel) {
+		const modelName = decision.routerModel.slice(decision.routerModel.indexOf("/") + 1);
+		heading += theme.fg("dim", ` · ${inlineText(modelName)}`);
+	}
+	heading += theme.fg("dim", ` · ${(decision.elapsedMs / 1_000).toFixed(2)}s`);
 	if (decision.status !== "selected") heading += theme.fg("warning", ` · ${decision.status}`);
 	if (!expanded) return new Text(`${heading} ${keyHint("app.tools.expand", "to expand")}`, 1, 0);
 
@@ -108,15 +124,35 @@ export function readDecision(entry: SessionEntry): EffortDecision | undefined {
 			!Number.isFinite(data.routerConfidence) || data.routerConfidence < 0 || data.routerConfidence > 1)) ||
 		(data.prepareMs !== undefined && !isNonnegativeNumber(data.prepareMs)) ||
 		(data.jevTiming !== undefined && !isJevTiming(data.jevTiming)) ||
+		(data.jevDiagnostics !== undefined && !isJevDiagnostics(data.jevDiagnostics)) ||
 		(data.routerProbabilities !== undefined && (!isRecord(data.routerProbabilities) ||
 			!Object.entries(data.routerProbabilities).every(([key, value]) => isEffort(key) && isNonnegativeNumber(value) && value <= 1))) ||
 		(data.routing !== undefined && !isRoutingDiagnostics(data.routing)) ||
+		(data.selectorAttempts !== undefined && (!Array.isArray(data.selectorAttempts) || data.selectorAttempts.length > 2 ||
+			!data.selectorAttempts.every((attempt: unknown) => isRecord(attempt) &&
+				["jev", "current-model"].includes(String(attempt.backend)) &&
+				["selected", "skipped", "failed", "cancelled"].includes(String(attempt.outcome)) &&
+				isNonnegativeNumber(attempt.timeoutMs) && isNonnegativeNumber(attempt.elapsedMs) &&
+				(attempt.interruption === undefined || ["deadline", "escape", "runtime", "auto-off", "settings-changed", "session-shutdown", "provider"].includes(String(attempt.interruption))) &&
+				(attempt.reason === undefined || typeof attempt.reason === "string")))) ||
 		(data.selectorResponses !== undefined && (!isRecord(data.selectorResponses) || !Object.entries(data.selectorResponses).every(([key, value]) =>
 			key === "effort" && isRouterResponseDiagnostics(value)))) ||
 		(data.selectorUsage !== undefined && (!isRecord(data.selectorUsage) || !Object.entries(data.selectorUsage).every(([key, value]) =>
 			key === "effort" && isRecord(value) && ["input", "output", "cacheRead", "cacheWrite", "cost"].every((field) => isNonnegativeNumber(value[field]))))) ||
 		typeof data.elapsedMs !== "number" || !Number.isFinite(data.elapsedMs) || data.elapsedMs < 0) return undefined;
 	return data as unknown as EffortDecision;
+}
+
+function isJevDiagnostics(value: unknown): value is JevDiagnostics {
+	if (!isRecord(value) || !["request", "response", "validation", "complete"].includes(String(value.stage)) ||
+		(value.errorCode !== undefined && !JEV_ERROR_CODES.some((code) => code === value.errorCode)) ||
+		!Object.keys(value).every((key) => ["stage", "errorCode", "responseType", "responseCharacters", "rawText", "rawTextTruncated"].includes(key))) return false;
+	if (value.responseType === undefined) return value.responseCharacters === undefined && value.rawText === undefined && value.rawTextTruncated === undefined;
+	return ["object", "array", "null", "string", "number", "boolean", "undefined"].includes(String(value.responseType)) &&
+		isNonnegativeNumber(value.responseCharacters) && Number.isSafeInteger(value.responseCharacters) &&
+		(value.rawText === undefined ? value.rawTextTruncated === undefined :
+			typeof value.rawText === "string" && value.rawText.length === Math.min(value.responseCharacters, JEV_RESPONSE_TEXT_LIMIT) &&
+			value.rawTextTruncated === (value.responseCharacters > JEV_RESPONSE_TEXT_LIMIT));
 }
 
 function isRouterResponseDiagnostics(value: unknown): value is RouterResponseDiagnostics {

@@ -6,7 +6,7 @@ Pi 扩展：每次任务开始前，自动选择当前模型的 thinking effort�
 
 ## 安装与使用
 
-需要 Node.js **22.19.0 或更高版本**及 Pi。
+需要 Node.js **22.19.0 或更高版本**及 Pi **0.87.1 或更高版本**。
 
 ```bash
 pi install npm:pi-auto
@@ -54,10 +54,10 @@ Jev 使用独立的 Undici 连接池，自动读取代理环境变量，**无需
 | `/auto on` | 开启自动选择 |
 | `/auto off` | 关闭自动选择，并取消正在进行的选档 |
 | `/auto status` | 查看后端、effort 和最近一次选档详情 |
-| `/auto default on` | 设置重启或重载后默认开启 |
-| `/auto default off` | 设置重启或重载后默认关闭 |
+| `/auto default on` | 立即开启，并保存为启动默认值 |
+| `/auto default off` | 立即关闭、取消正在进行的选档，并保存为启动默认值 |
 
-`/auto`、`/auto on` 和 `/auto off` 只作用于当前扩展实例。`/auto default on|off` 保存全局启动默认值，不改变当前状态，重启或重载后生效。若要立即关闭并在以后默认关闭，依次执行 `/auto off` 和 `/auto default off`。
+`/auto`、`/auto on` 和 `/auto off` 只作用于当前扩展实例。`/auto default on|off` 保存全局启动默认值，并立即应用到当前实例；`default off` 还会取消正在进行的选档。其他已运行实例不受影响，重启或重载时使用保存的默认值。
 
 默认值保存在 `<agent-dir>/pi-auto.json`，通常为 `~/.pi/agent/pi-auto.json`，遵循 `PI_CODING_AGENT_DIR`。文件不存在时默认开启；配置无效或无法读取时关闭自动选择并警告；保存失败不改变当前状态。不修改 Pi 自身的 `settings.json`。
 
@@ -65,13 +65,13 @@ Jev 使用独立的 Undici 连接池，自动读取代理环境变量，**无需
 
 ### 查看选档结果
 
-选择结果会保留在对话中，默认折叠。按默认快捷键 **Ctrl+O** 展开，查看档位变化、理由、选档后端、耗时和上下文摘要。
+选择结果会保留在对话中，默认折叠，并显示实际选档模型和选档总耗时，例如 `auto · high · jev-1.13.0 · 0.53s` 或 `auto · high · gpt-6-astra · 1.20s`。Jev 失败后由当前模型接管时，显示当前模型而不是 Jev；总耗时包含两次尝试。按默认快捷键 **Ctrl+O** 展开，查看档位变化、理由、选档后端、耗时和上下文摘要。
 
 `/auto status` 在交互终端打开只读浮窗，包含三个页面：
 
 - **Overview（概览）**：当前状态与最近一次选档，失败原因优先展示。
 - **Context（上下文）**：最近一轮的来源 ID、角色、字符范围、历史长度及是否省略其他历史。不展示原文；旧记录缺少这些信息时标记为未记录。
-- **Diagnostics（诊断）**：策略、effort 概率、用量、本地上下文准备耗时，以及选档请求的耗时与连接信息。
+- **Diagnostics（诊断）**：每次尝试的结果、期限及中断来源；当前模型的停止原因、内容类型和响应长度；策略、effort 概率、用量及请求耗时。
 
 默认 **Tab** 切页、**↑↓ / PageUp / PageDown** 滚动、**j / k** 向下／向上滚动、**Esc** 关闭。显式自定义键位优先于 j/k 别名，以浮窗提示为准。
 
@@ -79,17 +79,29 @@ Jev 使用独立的 Undici 连接池，自动读取代理环境变量，**无需
 
 ### 调试选择器返回
 
-当前模型的选档响应会在现有会话 JSONL 的 `pi-auto-decision` 条目中记录 `selectorResponses.effort`，包括停止原因、内容块类型和文本长度。已有字段仍保存模型、支持档位、耗时及用量。选档校验失败会细分为 `not_json_object`、`invalid_json`、`missing_effort`、`invalid_effort_type` 或 `unsupported_effort`，可在展开结果或 `/auto status` 中查看。
+当前模型的选档响应会在现有会话 JSONL 的 `pi-auto-decision` 条目中记录 `selectorResponses.effort`，包括停止原因、内容块类型和文本长度，这些信息也会显示在 `/auto status` 的诊断页。`selectorAttempts` 记录每个后端的尝试结果、耗时、期限和中断来源：`deadline`（本地超时）、`escape`（按 Esc）、`runtime`（运行时取消）、`auto-off`（关闭自动选择）、`settings-changed`（设置变化）、`session-shutdown`（会话关闭）或 `provider`（提供商中止）。旧记录缺少字段时显示为未记录；提供商中止不再被直接当作本地超时。已有字段仍保存模型、支持档位、耗时及用量。选档校验失败会细分为 `not_json_object`、`invalid_json`、`missing_effort`、`invalid_effort_type` 或 `unsupported_effort`，可在展开结果或 `/auto status` 中查看。
 
-默认不保存原始响应。需要捕获返回文本时，在启动终端运行：
+Jev 会保存 `jevDiagnostics`：最后阶段（`request` 请求、`response` 响应读取、`validation` 校验或 `complete` 完成）、具体错误码，以及可用时的解码后响应类型和长度。这些信息在 `/auto status` 中可见，回退到当前模型后仍保留。HTTP 状态、用量和连接耗时另存于 `jevTiming`。
+
+| Jev 错误码 | 含义 |
+| --- | --- |
+| `request_cancelled`、`request_timeout` | 请求取消或 SDK 超时 |
+| `http_error`、`transport_error`、`response_read_failed` | HTTP 错误、连接错误或响应正文读取失败 |
+| `invalid_envelope`、`invalid_model`、`invalid_answers` | 顶层响应、模型 ID 或答案对象无效 |
+| `missing_effort`、`unexpected_answers` | 缺少 effort 答案或返回了多余答案 |
+| `invalid_effort_answer`、`invalid_answer_type`、`unsupported_effort` | effort 答案对象无效、答案类型错误或档位不受支持 |
+| `invalid_confidence`、`invalid_probabilities`、`probability_keys_mismatch`、`invalid_probability` | 置信度、概率对象、选项键或概率数值无效 |
+| `probability_sum`、`choice_not_max` | 概率总和超出舍入容差，或选择的档位并非最高概率选项 |
+
+默认不保存响应正文。需要捕获返回文本时，在启动终端运行：
 
 ```bash
 PI_AUTO_DEBUG=1 pi
 ```
 
-启用后，成功及失败响应都会额外保存 `rawText`（文本块用换行连接，保留首尾空白），每次响应最多 **8,192 个 UTF-16 代码单元**，并用 `rawTextTruncated` 标记截断。不保存请求正文、鉴权信息、thinking 内容、工具参数或提供商错误正文。原始文本不会显示在状态界面，也不会加入主模型上下文。
+启用后，当前模型返回文本保存在 `selectorResponses.effort.rawText`（文本块用换行连接，保留首尾空白）；Jev 的成功 HTTP 响应解码后保存在 `jevDiagnostics.rawText`，包括校验失败的结果。Jev 的 JSON 会重新序列化，不是原始 HTTP 字节；非 JSON 返回保存为文本，并在保存前遮盖已知的 Jev API 密钥。每份记录最多 **8,192 个 UTF-16 代码单元**，并用 `rawTextTruncated` 标记截断。不保存请求正文、鉴权信息、thinking 内容、工具参数或提供商错误正文。原始文本不会显示在状态界面，也不会加入主模型上下文。
 
-**返回文本可能复述任务中的敏感信息，不会自动脱敏。** 分享日志前请人工检查；排查后不带该变量重启 Pi 即可关闭，已有记录不会自动删除。此开关仅捕获当前模型响应（包括 Jev 失败后的当前模型回退），不捕获 Jev 原始 HTTP 响应。请求未返回或返回晚于超时／取消时，没有可保存的响应；旧故障也无法补录。
+**返回文本可能复述任务中的敏感信息，不会自动脱敏。** 分享日志前请人工检查；排查后不带该变量重启 Pi 即可关闭，已有记录不会自动删除。此开关同时适用于 Jev 和当前模型，但不保存 HTTP 错误正文、请求头或 SDK 异常正文。请求未返回或返回晚于超时／取消时，没有可保存的响应；旧故障也无法补录。
 
 在 Pi 的 bash 工具中可读取当前会话的记录（使用 `jq`；会输出启用调试时保存的敏感文本）：
 
@@ -107,7 +119,7 @@ jq 'select(.type == "custom" and .customType == "pi-auto-decision") | .data | {r
 Jev 失败一次 → 当前模型接管选档 → 再失败则恢复 Pi 配置的默认 effort
 ```
 
-不进行请求重试，也不切换主模型。Jev 请求失败、超时或返回无效结果后，由当前模型接管选档。未启用 Jev 时，当前模型选档失败也会恢复配置的默认 effort。
+当前模型选档通过 Pi 的模型运行时统一处理系统指令和鉴权，不再直接调用底层提供商。不进行请求重试，也不切换主模型。Jev 请求失败、超时或返回无效结果后，由当前模型接管选档。未启用 Jev 时，当前模型选档失败也会恢复配置的默认 effort。
 
 Jev 和当前模型每次选档均有 **10 秒期限**。Jev 失败后的当前模型回退使用独立的 10 秒期限，两次尝试合计最多约 20 秒。无上下文分类请求，但选档请求本身仍可能超时。
 

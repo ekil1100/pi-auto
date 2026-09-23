@@ -12,9 +12,9 @@ import {
 import { matchesKey } from "@earendil-works/pi-tui";
 import { getAgentDir, SettingsManager, type BeforeAgentStartEvent, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { planEffort, ROUTER_RESPONSE_TEXT_LIMIT, type RouterResponseDiagnostics, type CompleteRouter, type RouterInvocation, type RoutingDiagnostics } from "./router.ts";
-import { JEV_MODEL, selectWithJev, type SelectJev, type JevTiming } from "./jev.ts";
+import { JEV_MODEL, selectWithJev, type SelectJev, type JevTiming, type JevDiagnostics } from "./jev.ts";
 import { collectHistory, hasContextImages } from "./session-context.ts";
-import { createSelectingWidget, DECISION_ENTRY_TYPE, formatAutoEffort, readDecision, renderDecisionEntry, type EffortDecision } from "./selection-ui.ts";
+import { createSelectingWidget, DECISION_ENTRY_TYPE, formatAutoEffort, readDecision, renderDecisionEntry, type EffortDecision, type SelectionAttempt } from "./selection-ui.ts";
 import { showAutoStatus } from "./status-ui.ts";
 import { createJevTransport } from "./jev-transport.ts";
 import { readDefaultEnabled, writeDefaultEnabled } from "./settings.ts";
@@ -43,13 +43,22 @@ export default function piAuto(pi: ExtensionAPI): void {
 	pi.registerEntryRenderer(DECISION_ENTRY_TYPE, renderDecisionEntry);
 	pi.registerCommand("auto", {
 		description: "Control automatic effort selection (toggle, on, off, status, default on/off)",
+		getArgumentCompletions: (prefix) => {
+			const normalized = prefix.trimStart().toLowerCase().replace(/\s+/g, " ");
+			const matches = ["toggle", "on", "off", "status", "default on", "default off"]
+				.filter((value) => value.startsWith(normalized));
+			return matches.length ? matches.map((value) => ({ value, label: value })) : null;
+		},
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase().replace(/\s+/g, " ") || "toggle";
 			if (action === "default on" || action === "default off") {
 				try {
 					writeDefaultEnabled(settingsPath, action === "default on");
 					settingsLoadFailed = false;
-					ctx.ui.notify(`pi-auto startup default: ${action === "default on" ? "on" : "off"}. Applies after restart or reload; current state unchanged.`, "info");
+					enabled = action === "default on";
+					if (!enabled) activeSelection?.abort("auto_disabled");
+					updateFooter(ctx, enabled);
+					ctx.ui.notify(`pi-auto ${enabled ? "enabled" : "disabled"}; startup default saved as ${enabled ? "on" : "off"}.`, "info");
 				} catch {
 					ctx.ui.notify("Could not save pi-auto startup default; current state unchanged.", "error");
 				}
@@ -57,7 +66,7 @@ export default function piAuto(pi: ExtensionAPI): void {
 			}
 			if (action === "toggle" || action === "on" || action === "off") {
 				enabled = action === "toggle" ? !enabled : action === "on";
-				if (!enabled) activeSelection?.abort();
+				if (!enabled) activeSelection?.abort("auto_disabled");
 				updateFooter(ctx, enabled);
 				ctx.ui.notify(enabled ? "pi-auto enabled (effort only)" : "pi-auto disabled", "info");
 				return;
@@ -95,7 +104,7 @@ export default function piAuto(pi: ExtensionAPI): void {
 	pi.on("thinking_level_select", (event, ctx) => { invalidateSelection(); updateFooter(ctx, enabled, event.level); });
 	pi.on("session_shutdown", async (_event, ctx) => {
 		stopped = true;
-		activeSelection?.abort();
+		activeSelection?.abort("session_shutdown");
 		ctx.ui.setWidget(PROGRESS_KEY, undefined);
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 		await jevTransport.dispose();
@@ -105,7 +114,7 @@ export default function piAuto(pi: ExtensionAPI): void {
 		if (!enabled || stopped || ctx.signal?.aborted) return;
 		const controller = new AbortController();
 		const userSignal = ctx.signal;
-		const onUserAbort = () => controller.abort("user_cancelled");
+		const onUserAbort = () => controller.abort("runtime_cancelled");
 		userSignal?.addEventListener("abort", onUserAbort, { once: true });
 		activeSelection = controller;
 		const initialModel = ctx.model;
@@ -117,14 +126,18 @@ export default function piAuto(pi: ExtensionAPI): void {
 		let routerConfidence: number | undefined;
 		let prepareMs: number | undefined;
 		let jevTiming: JevTiming | undefined;
+		let jevDiagnostics: JevDiagnostics | undefined;
 		let routerProbabilities: Record<string, number> | undefined;
 		let routing: RoutingDiagnostics | undefined;
+		const selectorAttempts: SelectionAttempt[] = [];
 		const selectorUsage: NonNullable<EffortDecision["selectorUsage"]> = {};
 		const selectorResponses: NonNullable<EffortDecision["selectorResponses"]> = {};
 		const debugResponses = process.env.PI_AUTO_DEBUG === "1";
 		const interrupted = (): Pick<EffortDecision, "status" | "reason"> => controller.signal.reason === "settings_changed"
 			? { status: "kept", reason: "Model, effort or session changed during selection" }
-			: { status: "cancelled", reason: controller.signal.reason === "user_cancelled" ? "Selection cancelled by user" : "Auto disabled during selection" };
+			: { status: "cancelled", reason: controller.signal.reason === "user_cancelled" ? "Selection cancelled by user" :
+				controller.signal.reason === "runtime_cancelled" ? "Selection cancelled by runtime" :
+				controller.signal.reason === "session_shutdown" ? "Session shut down during selection" : "Auto disabled during selection" };
 		const typesafeApiKey = process.env.TYPESAFE_API_KEY?.trim();
 		const settingsChanged = () => initialRevision !== selectionRevision || !modelsAreEqual(ctx.model, initialModel) ||
 			(ctx.thinkingLevel ?? "off") !== previousEffort;
@@ -132,10 +145,15 @@ export default function piAuto(pi: ExtensionAPI): void {
 		let outcome: Pick<EffortDecision, "status" | "reason"> = { status: "kept", reason: "Selection interrupted" };
 		const runSelection = async (useJev: boolean) => {
 			const attempt = new AbortController();
-			const signal = AbortSignal.any([controller.signal, attempt.signal, AbortSignal.timeout(ROUTER_TIMEOUT_MS)]);
+			const deadline = AbortSignal.timeout(ROUTER_TIMEOUT_MS);
+			const signal = AbortSignal.any([controller.signal, attempt.signal, deadline]);
+			const attemptStartedAt = performance.now();
+			const trace: SelectionAttempt = {
+				backend: useJev ? "jev" : "current-model", outcome: "failed", timeoutMs: ROUTER_TIMEOUT_MS, elapsedMs: 0,
+			};
 			let acceptingDiagnostics = true;
 			try {
-				return await planForEvent(event, ctx, signal, (invocation) => {
+				const result = await planForEvent(event, ctx, signal, (invocation) => {
 					prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
 					routerModel = modelKey(invocation.model);
 					routerEffort = invocation.effort;
@@ -146,7 +164,9 @@ export default function piAuto(pi: ExtensionAPI): void {
 					prepareMs ??= Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
 					routerModel = `typesafe/${JEV_MODEL}`;
 					const decision = await selectWithJev(typesafeApiKey, {
-						...invocation, onTiming: (timing) => { if (acceptingDiagnostics) jevTiming = structuredClone(timing); },
+						...invocation, debugResponses,
+						onTiming: (timing) => { if (acceptingDiagnostics) jevTiming = structuredClone(timing); },
+						onDiagnostics: (value) => { if (acceptingDiagnostics) jevDiagnostics = structuredClone(value); },
 					}, jevTransport.fetch);
 					if (acceptingDiagnostics) {
 						routerModel = `typesafe/${decision.model}`;
@@ -155,7 +175,21 @@ export default function piAuto(pi: ExtensionAPI): void {
 					}
 					return decision;
 				} : undefined, (value) => { if (acceptingDiagnostics) routing = structuredClone(value); });
+				trace.outcome = result.status;
+				if (result.status === "skipped") trace.reason = result.reason;
+				return result;
+			} catch (error) {
+				if (controller.signal.aborted) {
+					trace.outcome = "cancelled";
+					trace.interruption = cancellationSource(controller.signal.reason);
+				} else if (deadline.aborted) trace.interruption = "deadline";
+				else if (errorMessage(error) === "router provider aborted the request") trace.interruption = "provider";
+				trace.reason = trace.interruption === "deadline" ? "router timed out" :
+					trace.outcome === "cancelled" ? interrupted().reason : errorMessage(error);
+				throw new Error(trace.reason);
 			} finally {
+				trace.elapsedMs = Math.max(0, Math.round(performance.now() - attemptStartedAt));
+				selectorAttempts.push(trace);
 				// Freeze this attempt's diagnostics before aborting any non-cooperative work.
 				acceptingDiagnostics = false;
 				attempt.abort();
@@ -237,8 +271,10 @@ export default function piAuto(pi: ExtensionAPI): void {
 					...(routerConfidence !== undefined ? { routerConfidence } : {}),
 					...(prepareMs !== undefined ? { prepareMs } : {}),
 					...(jevTiming ? { jevTiming: structuredClone(jevTiming) } : {}),
+					...(jevDiagnostics ? { jevDiagnostics: structuredClone(jevDiagnostics) } : {}),
 					...(routerProbabilities ? { routerProbabilities: { ...routerProbabilities } } : {}),
 					...(routing ? { routing: structuredClone(routing) } : {}),
+					selectorAttempts,
 					...(Object.keys(selectorUsage).length ? { selectorUsage: structuredClone(selectorUsage) } : {}),
 					...(Object.keys(selectorResponses).length ? { selectorResponses: structuredClone(selectorResponses) } : {}),
 					elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
@@ -281,19 +317,14 @@ async function completeRouter(
 	onUsage: (usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }) => void,
 	onResponse: (response: RouterResponseDiagnostics) => void,
 ): Promise<string> {
-	const provider = ctx.modelRegistry.getProvider(invocation.model.provider);
-	if (!provider) throw new Error(`provider is unavailable for ${modelKey(invocation.model)}`);
-	let auth: Awaited<ReturnType<ExtensionContext["modelRegistry"]["getApiKeyAndHeaders"]>>;
-	try { auth = await ctx.modelRegistry.getApiKeyAndHeaders(invocation.model); }
-	catch { throw new Error("router authentication failed"); }
 	invocation.signal.throwIfAborted();
-	if (!auth.ok) throw new Error("router authentication failed");
 
 	// Provider exceptions can echo request bodies or credentials, not just status codes.
 	let response: AssistantMessage;
 	try {
-		response = await provider.streamSimple(
-			auth.baseUrl ? { ...invocation.model, baseUrl: auth.baseUrl } : invocation.model,
+		// The runtime normalizes system messages and resolves provider authentication.
+		response = await ctx.modelRegistry.streamSimple(
+			invocation.model,
 			{
 				systemPrompt: invocation.systemPrompt,
 				messages: [{
@@ -303,9 +334,6 @@ async function completeRouter(
 				}],
 			},
 			{
-				...(auth.apiKey !== undefined ? { apiKey: auth.apiKey } : {}),
-				...(auth.headers !== undefined ? { headers: auth.headers } : {}),
-				...(auth.env !== undefined ? { env: auth.env } : {}),
 				signal: invocation.signal,
 				maxRetries: 0,
 				maxTokens: Math.min(ROUTER_MAX_OUTPUT_TOKENS, invocation.model.maxTokens),
@@ -328,7 +356,7 @@ async function completeRouter(
 		textCharacters: text.length,
 		...(debugResponses ? { rawText: text.slice(0, ROUTER_RESPONSE_TEXT_LIMIT), rawTextTruncated: text.length > ROUTER_RESPONSE_TEXT_LIMIT } : {}),
 	});
-	if (response.stopReason === "aborted") throw new Error("router timed out");
+	if (response.stopReason === "aborted") throw new Error("router provider aborted the request");
 	if (response.stopReason === "length") throw new Error("router reached the output limit");
 	if (response.stopReason === "error") throw new Error("router request failed");
 	if (!text.trim()) throw new Error("router returned no decision");
@@ -338,7 +366,7 @@ async function completeRouter(
 async function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
 	let onAbort: () => void = () => {};
 	const aborted = new Promise<never>((_resolve, reject) => {
-		onAbort = () => reject(new Error("router timed out"));
+		onAbort = () => reject(new Error("router request interrupted"));
 		signal.addEventListener("abort", onAbort, { once: true });
 		if (signal.aborted) onAbort();
 	});
@@ -346,6 +374,17 @@ async function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise
 		return await Promise.race([operation, aborted]);
 	} finally {
 		signal.removeEventListener("abort", onAbort);
+	}
+}
+
+function cancellationSource(reason: unknown): NonNullable<SelectionAttempt["interruption"]> {
+	switch (reason) {
+		case "user_cancelled": return "escape";
+		case "runtime_cancelled": return "runtime";
+		case "auto_disabled": return "auto-off";
+		case "settings_changed": return "settings-changed";
+		case "session_shutdown": return "session-shutdown";
+		default: return "runtime";
 	}
 }
 
