@@ -1,6 +1,6 @@
 {
   "name": "pi-auto",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Automatically select thinking effort for each task without changing the current Pi model",
   "license": "MIT",
   "repository": {
