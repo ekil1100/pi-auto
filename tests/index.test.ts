@@ -133,7 +133,7 @@ function createHarness(
 	piAuto(pi as unknown as ExtensionAPI);
 
 	async function emit(event: ExtensionEvent) {
-		await handlers.get(event.type)?.(event, ctx as unknown as ExtensionContext);
+		return await handlers.get(event.type)?.(event, ctx as unknown as ExtensionContext);
 	}
 
 	return {
@@ -1796,5 +1796,33 @@ describe("history routing lifecycle", () => {
 			stopReason: "stop", textCharacters: 0, contentTypes: ["thinking"], rawText: "", rawTextTruncated: false,
 		});
 		expect(decisions(harness)[0]?.reason).toContain("router returned no decision");
+	});
+});
+
+describe("main request effort history integration", () => {
+	it("keeps update history after /auto off and honors manual changes at the next user", async () => {
+		const current = createModel("gpt-6-astra", { provider: "openai", baseUrl: "https://api.openai.com/v1" });
+		const h = createHarness(current);
+		const input: Record<string, unknown>[] = [{ role: "user", content: "First" }];
+		const request = () => h.emit({ type: "before_provider_request", payload: {
+			model: current.id, stream: true, reasoning: { effort: h.ctx.thinkingLevel }, input: [...input],
+		} });
+		await h.start("First");
+		expect(await request()).toMatchObject({ reasoning: { effort: "high" }, input });
+		input.push({ role: "assistant", content: "Done" }, { role: "user", content: "Second" });
+		h.complete.mockResolvedValueOnce(routerResponse(current, { content: [{ type: "text", text: '{"effort":"low"}' }] }));
+		await h.start("Second");
+		const second = await request();
+		expect(second).toMatchObject({ reasoning: { effort: "high" }, input: [input[0], input[1],
+			{ type: "configuration_update", reasoning: { effort: "low" } }, input[2]] });
+		await h.command("off");
+		h.pi.setThinkingLevel("medium");
+		expect(await request()).toEqual(second); // No new user: do not rewrite the old request.
+		input.push({ role: "assistant", content: "Done again" }, { role: "user", content: "Third" });
+		await h.start("Third");
+		expect(await request()).toMatchObject({ reasoning: { effort: "high" }, input: [input[0], input[1],
+			{ type: "configuration_update", reasoning: { effort: "low" } }, input[2], input[3],
+			{ type: "configuration_update", reasoning: { effort: "medium" } }, input[4]] });
+		expect(h.complete).toHaveBeenCalledTimes(2);
 	});
 });

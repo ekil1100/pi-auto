@@ -119,6 +119,28 @@ Runtime cancellation signals, `/auto off`, and changes to the model, effort, or 
 
 Both backends send the current input and the selected previous turn without local truncation. Even a single turn can be large, increasing cost and latency or exceeding provider limits.
 
+## GPT-6 effort changes and prompt caching
+
+For supported main-model requests, pi-auto follows OpenAI's [mid-conversation reasoning updates](https://developers.openai.com/api/docs/guides/reasoning#change-reasoning-mid-conversation): it keeps the first request's top-level `reasoning.effort` and inserts a `configuration_update` before the next new user message. Later requests replay every update in its original position. Switching effort therefore does not rewrite an already-sent input prefix; ordinary cache size, lifetime, and routing requirements still apply. **This is prefix preservation, not a guarantee of cache hits or measured cost/latency savings.**
+
+The allowlist is deliberately narrow:
+
+| Provider / API | Models | Endpoint |
+| --- | --- | --- |
+| `openai` / `openai-responses` | `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` | `https://api.openai.com/v1` |
+| `openai-codex` / `openai-codex-responses` | `gpt-6-astra` only | `https://chatgpt.com/backend-api` |
+
+OpenAI documents standard, single-agent GPT-6 support. Codex Astra accepted the update and exact prefix replay in a real Pi 0.87.1 SSE smoke test; cache-performance benefits and live WebSocket behavior have not been verified. Pi's Codex WebSocket path receives the transformed full history before its own incremental-request processing; pi-auto does not change transports.
+
+- The first observed request establishes the baseline without an update. Repeated requests and retries do not duplicate or move updates. Several effort choices before dispatch produce only the final choice.
+- Tool-only continuations retain the effective effort. A manual change during tool execution waits for a new user-message boundary; no update is inserted before a tool result or while tool calls are unresolved. Until then, Pi's effort display reflects the requested level, not the still-active wire-level effort.
+- `/auto off` disables selection, not history replay. Manual `/thinking` changes use the same boundary rules, so disabling auto does not erase earlier updates.
+- Branch-local metadata is saved as `pi-auto-openai-effort-cache` custom entries: baseline, update positions, efforts, and input hashes, not message text, tool output, or credentials. Each request reads the active branch, including after reload, resume, tree navigation, or fork.
+- Model changes, Pi compaction, branch summaries, and changed/shortened provider history establish a fresh baseline. An existing session without this metadata also starts a new baseline; its earlier cache prefix cannot be recovered. Pi's local summarization remains available and does not send these wire-only updates to the summarizer.
+- Pro/multi-agent requests, server automatic compaction/truncation, server-managed history (`previous_response_id` or `conversation` supplied before the hook), standalone compact requests, and unfamiliar native input-item types are not transformed. Neither are other models/APIs/providers, aliases, or third-party endpoints merely named GPT. Existing updates from another extension are not taken over. Leaving supported mode ends the old baseline.
+
+No API-error fallback silently removes updates, and this feature makes no extra model calls. Other extensions that rewrite requests after this hook can still invalidate the prefix. The provider response's `reasoning.effort` reports the original top-level setting, not the latest update.
+
 ## Costs and limits
 
 - Only effort levels supported by the current model can be selected. A model with just one supported level uses it without an extra model call.

@@ -18,6 +18,7 @@ import { createSelectingWidget, DECISION_ENTRY_TYPE, formatAutoEffort, readDecis
 import { showAutoStatus } from "./status-ui.ts";
 import { createJevTransport } from "./jev-transport.ts";
 import { readDefaultEnabled, writeDefaultEnabled } from "./settings.ts";
+import { registerOpenAIEffortCache } from "./openai-effort-cache.ts";
 
 const ROUTER_TIMEOUT_MS = 10_000;
 const ROUTER_MAX_OUTPUT_TOKENS = 2_048;
@@ -25,6 +26,7 @@ const STATUS_KEY = "pi-auto";
 const PROGRESS_KEY = "pi-auto-selecting";
 
 export default function piAuto(pi: ExtensionAPI): void {
+	registerOpenAIEffortCache(pi);
 	const jevTransport = createJevTransport();
 	const settingsPath = join(getAgentDir(), "pi-auto.json");
 	let enabled: boolean;
