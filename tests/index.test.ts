@@ -1799,8 +1799,8 @@ describe("history routing lifecycle", () => {
 	});
 });
 
-describe("main request effort history integration", () => {
-	it("keeps update history after /auto off and honors manual changes at the next user", async () => {
+describe("main request payload isolation", () => {
+	it("leaves provider requests untouched across automatic and manual effort changes", async () => {
 		const current = createModel("gpt-6-astra", { provider: "openai", baseUrl: "https://api.openai.com/v1" });
 		const h = createHarness(current);
 		const input: Record<string, unknown>[] = [{ role: "user", content: "First" }];
@@ -1808,21 +1808,21 @@ describe("main request effort history integration", () => {
 			model: current.id, stream: true, reasoning: { effort: h.ctx.thinkingLevel }, input: [...input],
 		} });
 		await h.start("First");
-		expect(await request()).toMatchObject({ reasoning: { effort: "high" }, input });
+		expect(h.ctx.thinkingLevel).toBe("high");
+		expect(await request()).toBeUndefined();
 		input.push({ role: "assistant", content: "Done" }, { role: "user", content: "Second" });
 		h.complete.mockResolvedValueOnce(routerResponse(current, { content: [{ type: "text", text: '{"effort":"low"}' }] }));
 		await h.start("Second");
-		const second = await request();
-		expect(second).toMatchObject({ reasoning: { effort: "high" }, input: [input[0], input[1],
-			{ type: "configuration_update", reasoning: { effort: "low" } }, input[2]] });
+		expect(h.ctx.thinkingLevel).toBe("low");
+		expect(await request()).toBeUndefined();
 		await h.command("off");
 		h.pi.setThinkingLevel("medium");
-		expect(await request()).toEqual(second); // No new user: do not rewrite the old request.
+		expect(h.ctx.thinkingLevel).toBe("medium");
+		expect(await request()).toBeUndefined();
 		input.push({ role: "assistant", content: "Done again" }, { role: "user", content: "Third" });
 		await h.start("Third");
-		expect(await request()).toMatchObject({ reasoning: { effort: "high" }, input: [input[0], input[1],
-			{ type: "configuration_update", reasoning: { effort: "low" } }, input[2], input[3],
-			{ type: "configuration_update", reasoning: { effort: "medium" } }, input[4]] });
+		expect(h.ctx.thinkingLevel).toBe("medium");
+		expect(await request()).toBeUndefined();
 		expect(h.complete).toHaveBeenCalledTimes(2);
 	});
 });
