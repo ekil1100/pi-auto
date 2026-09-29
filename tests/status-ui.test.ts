@@ -8,7 +8,7 @@ import { AutoStatusPanel, buildStatusPages, showAutoStatus, type AutoStatus } fr
 function decision(): EffortDecision {
 	return {
 		status: "selected", model: "test/previous", previousEffort: "medium", effort: "high",
-		routerModel: "typesafe/jev", routerEffort: undefined, reason: "Selected by Jev Choice", elapsedMs: 320,
+		routerModel: "typesafe/jev", routerEffort: undefined, reason: "Selected by Classifier Choice", elapsedMs: 320,
 		routerConfidence: 0.8, routerProbabilities: { low: 0.1, medium: 0.1, high: 0.8 },
 		routing: {
 			policyVersion: "1", supportedEfforts: ["low", "medium", "high"], taskTruncated: false, selectionMs: 200,
@@ -44,7 +44,7 @@ describe("status information hierarchy", () => {
 	it("separates current settings from the previous selection and hides technical detail on overview", () => {
 		const overview = text(status(), 0);
 		expect(overview).toContain("Current (at open)\nAuto: enabled");
-		expect(overview).toContain("Current model: test/current\nCurrent effort: low");
+		expect(overview).toContain("Answering model: test/current\nCurrent effort: low");
 		expect(overview).toContain("Last selection\nEffort: medium -> high | selected | 0.32s");
 		expect(overview).toContain("Model: test/previous");
 		expect(overview).not.toMatch(/Confidence|Policy|socket|Candidate:/);
@@ -113,10 +113,21 @@ describe("status information hierarchy", () => {
 
 	it("keeps complete probabilities and usage accessible without success-rate claims", () => {
 		const last = decision();
-		last.jevTiming = { outputTokens: 1 }; // Unknown input is not zero.
+		last.classifierTiming = { outputTokens: 1 }; // Unknown input is not zero.
 
 		const page = text(status(last), 2);
 		for (const value of ["low: 0.1", "high: 0.8", "not task success probability", "not included in Pi footer", "unknown input / 1 output"]) expect(page).toContain(value);
+	});
+
+	it("shows native classifier diagnostics, usage and cost without invented transport fields", () => {
+		const last = decision();
+		last.classifierTiming = { classifyMs: 31, validateMs: 0.2, totalMs: 32, inputTokens: 250, outputTokens: 0, cost: 0 };
+		last.classifierDiagnostics = { stage: "complete", stopReason: "stop", responseType: "object", responseCharacters: 7,
+			rawText: "private", rawTextTruncated: false };
+		const page = text(status(last), 2);
+		for (const value of ["Stop reason: stop", "classify 31.0ms", "validate 0.2ms", "total 32.0ms", "250 input / 0 output",
+			"Classifier catalog cost: $0", "zero does not imply free usage", "classifierDiagnostics.rawText"]) expect(page).toContain(value);
+		expect(page).not.toMatch(/private|HTTP status:|Request bytes:|socket #|connection new|headers [0-9]/);
 	});
 
 	it("shows current-model response metadata and explains missing raw logs", () => {
@@ -135,11 +146,11 @@ describe("status information hierarchy", () => {
 	it("shows per-attempt deadlines and interruption sources after fallback", () => {
 		const last = decision();
 		last.selectorAttempts = [
-			{ backend: "jev", outcome: "failed", interruption: "deadline", timeoutMs: 10_000, elapsedMs: 10_000, reason: "router timed out" },
+			{ backend: "classifier", outcome: "failed", interruption: "deadline", timeoutMs: 10_000, elapsedMs: 10_000, reason: "router timed out" },
 			{ backend: "current-model", outcome: "failed", interruption: "provider", timeoutMs: 10_000, elapsedMs: 12, reason: "router provider aborted the request" },
 		];
 		const page = text(status(last), 2);
-		for (const value of ["1. jev: failed", "2. current-model: failed", "Interruption source: deadline", "Interruption source: provider", "Elapsed: 12ms | Deadline: 10000ms"]) expect(page).toContain(value);
+		for (const value of ["1. classifier: failed", "2. current-model: failed", "Interruption source: deadline", "Interruption source: provider", "Elapsed: 12ms | Deadline: 10000ms"]) expect(page).toContain(value);
 	});
 
 	it("locates opt-in raw logs without displaying private response text", () => {

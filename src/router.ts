@@ -1,7 +1,7 @@
 import { getSupportedThinkingLevels, type Api, type AssistantMessage, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getRecentContext, type ContextSource } from "./recent-context.ts";
 import { EFFORT_INSTRUCTIONS, EFFORT_POLICY_VERSION, getEffortCriteria } from "./effort-policy.ts";
-import type { SelectJev } from "./jev.ts";
+import type { SelectClassifier } from "./classifier.ts";
 import type { HistoryMessage } from "./session-context.ts";
 
 const MAX_REASON_LENGTH = 160;
@@ -46,7 +46,7 @@ export interface RoutingDiagnostics {
 
 export interface RouterInvocation {
 	model: Model<Api>;
-	effort: Exclude<ModelThinkingLevel, "off">;
+	effort: Exclude<ModelThinkingLevel, "off"> | undefined;
 	purpose: "effort";
 	systemPrompt: string;
 	userPrompt: string;
@@ -59,6 +59,8 @@ export interface PlanEffortInput {
 	task: string;
 	hasImages: boolean;
 	currentModel: Model<Api> | undefined;
+	/** The judge only; candidates and the returned plan belong to currentModel. */
+	selectorModel?: Model<Api>;
 	currentEffort: ModelThinkingLevel;
 	history: readonly HistoryMessage[];
 	signal: AbortSignal;
@@ -76,7 +78,7 @@ export type PlanEffortResult =
 	| { status: "selected"; plan: EffortPlan }
 	| { status: "skipped"; reason: string };
 
-export async function planEffort(input: PlanEffortInput, complete: CompleteRouter, selectJev?: SelectJev): Promise<PlanEffortResult> {
+export async function planEffort(input: PlanEffortInput, complete: CompleteRouter, selectClassifier?: SelectClassifier): Promise<PlanEffortResult> {
 	const model = input.currentModel;
 	if (!model) return { status: "skipped", reason: "No current model is selected" };
 	const efforts = getSupportedThinkingLevels(model);
@@ -93,9 +95,9 @@ export async function planEffort(input: PlanEffortInput, complete: CompleteRoute
 		return { status: "selected", plan: { model, effort: efforts[0]!, reason: "Only supported effort", routerEffort: undefined } };
 	}
 	input.signal.throwIfAborted();
-	const reasoningLevels = efforts.filter((level): level is Exclude<ModelThinkingLevel, "off"> => level !== "off");
+	const selectorModel = input.selectorModel ?? model;
+	const reasoningLevels = getSupportedThinkingLevels(selectorModel).filter((level): level is Exclude<ModelThinkingLevel, "off"> => level !== "off");
 	const routerEffort = reasoningLevels.includes("low") ? "low" : reasoningLevels[0];
-	if (!routerEffort) throw new Error("Invariant violated: missing router effort");
 	const task = input.task;
 	const contextStartedAt = performance.now();
 	const context = getRecentContext(input.history);
@@ -115,14 +117,14 @@ export async function planEffort(input: PlanEffortInput, complete: CompleteRoute
 	};
 	const selectionStartedAt = performance.now();
 	try {
-		if (selectJev) {
-			const decision = await selectJev({ state, signal: input.signal });
+		if (selectClassifier) {
+			const decision = await selectClassifier({ state, signal: input.signal });
 			input.signal.throwIfAborted();
-			if (!efforts.includes(decision.effort)) throw new Error("Jev returned an unsupported effort");
-			return { status: "selected", plan: { model, effort: decision.effort, reason: "Selected by Jev Choice", routerEffort: undefined } };
+			if (!efforts.includes(decision.effort)) throw new Error("Classifier returned an unsupported effort");
+			return { status: "selected", plan: { model, effort: decision.effort, reason: "Selected by Classifier Choice", routerEffort: undefined } };
 		}
 		const responseText = await complete({
-			model, effort: routerEffort, purpose: "effort", signal: input.signal,
+			model: selectorModel, effort: routerEffort, purpose: "effort", signal: input.signal,
 			systemPrompt: `${EFFORT_INSTRUCTIONS}\nSupported effort criteria: ${JSON.stringify(getEffortCriteria(efforts))}\nReturn JSON only: {"effort":"<supported effort>","reason":"<brief English reason, max 160 characters>"}.`,
 			userPrompt: JSON.stringify(state),
 		});

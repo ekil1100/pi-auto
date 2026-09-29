@@ -1,5 +1,5 @@
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { JEV_ERROR_CODES, JEV_RESPONSE_TEXT_LIMIT, type JevDiagnostics, type JevTiming } from "./jev.ts";
+import { CLASSIFIER_ERROR_CODES, CLASSIFIER_RESPONSE_TEXT_LIMIT, type ClassifierDiagnostics, type ClassifierTiming } from "./classifier.ts";
 import { ROUTER_RESPONSE_TEXT_LIMIT, type RouterResponseDiagnostics, type RoutingDiagnostics } from "./router.ts";
 import { keyHint, type EntryRenderer, type SessionEntry, type Theme } from "@earendil-works/pi-coding-agent";
 import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
@@ -12,7 +12,7 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 const SPINNER_INTERVAL_MS = 80;
 
 export interface SelectionAttempt {
-	backend: "jev" | "current-model";
+	backend: "classifier" | "chat" | "current-model";
 	outcome: "selected" | "skipped" | "failed" | "cancelled";
 	timeoutMs: number;
 	elapsedMs: number;
@@ -22,6 +22,7 @@ export interface SelectionAttempt {
 
 export interface EffortDecision {
 	status: "selected" | "kept" | "cancelled";
+	actualBackend?: string;
 	model: string;
 	previousEffort: ModelThinkingLevel;
 	effort: ModelThinkingLevel;
@@ -30,8 +31,8 @@ export interface EffortDecision {
 	routerEffort: Exclude<ModelThinkingLevel, "off"> | undefined;
 	routerConfidence?: number;
 	prepareMs?: number;
-	jevTiming?: JevTiming;
-	jevDiagnostics?: JevDiagnostics;
+	classifierTiming?: ClassifierTiming;
+	classifierDiagnostics?: ClassifierDiagnostics;
 	routerProbabilities?: Record<string, number>;
 	routing?: RoutingDiagnostics;
 	selectorAttempts?: SelectionAttempt[];
@@ -40,23 +41,16 @@ export interface EffortDecision {
 	elapsedMs: number;
 }
 
-export function formatAutoEffort(theme: Theme, effort: ModelThinkingLevel): string {
-	return theme.fg("accent", "auto") + theme.fg("dim", " · ") + theme.getThinkingBorderColor(effort)(effort);
+export function formatAutoEffort(theme: Theme, effort: ModelThinkingLevel, backend?: string): string {
+	return theme.fg("accent", "auto") + theme.fg("dim", " · ") + theme.getThinkingBorderColor(effort)(effort) + (backend ? theme.fg("dim", ` · ${inlineText(backend)}`) : "");
 }
 
-export function formatJevTiming(timing: JevTiming): string {
-	const labels = { setupMs: "setup", headersMs: "headers", bodyAndDecodeMs: "body/decode", validateMs: "validate", totalMs: "total" } as const;
+export function formatClassifierTiming(timing: ClassifierTiming): string {
+	const labels = { classifyMs: "classify", validateMs: "validate", totalMs: "total" } as const;
 	const parts = Object.entries(labels).flatMap(([key, label]) => {
 		const value = timing[key as keyof typeof labels];
 		return value === undefined ? [] : [`${label} ${value.toFixed(1)}ms`];
 	});
-	const transport = timing.transport;
-	if (transport) {
-		parts.push(`transport ${transport.status}`, `connection ${transport.connection}`);
-		if (transport.socketId !== undefined) parts.push(`socket #${transport.socketId}`);
-		if (transport.connectMs !== undefined) parts.push(`connect ${transport.connectMs.toFixed(1)}ms`);
-		if (transport.afterUploadMs !== undefined) parts.push(`after-upload ${transport.afterUploadMs.toFixed(1)}ms`);
-	}
 	return parts.join(" · ");
 }
 
@@ -79,8 +73,8 @@ export const renderDecisionEntry: EntryRenderer<EffortDecision> = (entry, { expa
 	const decision = readDecision(entry);
 	if (!decision) return undefined;
 
-	let heading = formatAutoEffort(theme, decision.effort);
-	if (decision.routerModel) {
+	let heading = formatAutoEffort(theme, decision.effort, decision.actualBackend);
+	if (!decision.actualBackend && decision.routerModel) {
 		const modelName = decision.routerModel.slice(decision.routerModel.indexOf("/") + 1);
 		heading += theme.fg("dim", ` · ${inlineText(modelName)}`);
 	}
@@ -114,7 +108,16 @@ export function formatContextSummary(context: NonNullable<RoutingDiagnostics["co
 export function readDecision(entry: SessionEntry): EffortDecision | undefined {
 	if (entry.type !== "custom" || entry.customType !== DECISION_ENTRY_TYPE) return undefined;
 	if (!entry.data || typeof entry.data !== "object" || Array.isArray(entry.data)) return undefined;
-	const data = entry.data as Record<string, unknown>;
+	const { classifierTiming, classifierDiagnostics, actualBackend, jevTiming: _oldTiming, jevDiagnostics: _oldDiagnostics, ...fields } = entry.data as Record<string, unknown>;
+	// Optional diagnostics must not hide a valid saved decision after schema changes.
+	const timing = readClassifierTiming(classifierTiming);
+	if (Array.isArray(fields.selectorAttempts) && fields.selectorAttempts.some((item) => isRecord(item) && item.backend === "jev")) delete fields.selectorAttempts;
+	const data: Record<string, unknown> = {
+		...fields,
+		...(typeof actualBackend === "string" ? { actualBackend } : {}),
+		...(timing ? { classifierTiming: timing } : {}),
+		...(isClassifierDiagnostics(classifierDiagnostics) ? { classifierDiagnostics } : {}),
+	};
 	if ((data.status !== "selected" && data.status !== "kept" && data.status !== "cancelled") ||
 		typeof data.model !== "string" || typeof data.reason !== "string" ||
 		!isEffort(data.previousEffort) || !isEffort(data.effort) ||
@@ -123,14 +126,12 @@ export function readDecision(entry: SessionEntry): EffortDecision | undefined {
 		(data.routerConfidence !== undefined && (typeof data.routerConfidence !== "number" ||
 			!Number.isFinite(data.routerConfidence) || data.routerConfidence < 0 || data.routerConfidence > 1)) ||
 		(data.prepareMs !== undefined && !isNonnegativeNumber(data.prepareMs)) ||
-		(data.jevTiming !== undefined && !isJevTiming(data.jevTiming)) ||
-		(data.jevDiagnostics !== undefined && !isJevDiagnostics(data.jevDiagnostics)) ||
 		(data.routerProbabilities !== undefined && (!isRecord(data.routerProbabilities) ||
 			!Object.entries(data.routerProbabilities).every(([key, value]) => isEffort(key) && isNonnegativeNumber(value) && value <= 1))) ||
 		(data.routing !== undefined && !isRoutingDiagnostics(data.routing)) ||
 		(data.selectorAttempts !== undefined && (!Array.isArray(data.selectorAttempts) || data.selectorAttempts.length > 2 ||
 			!data.selectorAttempts.every((attempt: unknown) => isRecord(attempt) &&
-				["jev", "current-model"].includes(String(attempt.backend)) &&
+				["classifier", "chat", "current-model"].includes(String(attempt.backend)) &&
 				["selected", "skipped", "failed", "cancelled"].includes(String(attempt.outcome)) &&
 				isNonnegativeNumber(attempt.timeoutMs) && isNonnegativeNumber(attempt.elapsedMs) &&
 				(attempt.interruption === undefined || ["deadline", "escape", "runtime", "auto-off", "settings-changed", "session-shutdown", "provider"].includes(String(attempt.interruption))) &&
@@ -143,16 +144,17 @@ export function readDecision(entry: SessionEntry): EffortDecision | undefined {
 	return data as unknown as EffortDecision;
 }
 
-function isJevDiagnostics(value: unknown): value is JevDiagnostics {
-	if (!isRecord(value) || !["request", "response", "validation", "complete"].includes(String(value.stage)) ||
-		(value.errorCode !== undefined && !JEV_ERROR_CODES.some((code) => code === value.errorCode)) ||
-		!Object.keys(value).every((key) => ["stage", "errorCode", "responseType", "responseCharacters", "rawText", "rawTextTruncated"].includes(key))) return false;
+function isClassifierDiagnostics(value: unknown): value is ClassifierDiagnostics {
+	if (!isRecord(value) || !["request", "validation", "complete"].includes(String(value.stage)) ||
+		(value.errorCode !== undefined && !CLASSIFIER_ERROR_CODES.some((code) => code === value.errorCode)) ||
+		!Object.keys(value).every((key) => ["stage", "errorCode", "stopReason", "responseType", "responseCharacters", "rawText", "rawTextTruncated"].includes(key))) return false;
+	if (value.stopReason !== undefined && !["stop", "error", "aborted"].includes(String(value.stopReason))) return false;
 	if (value.responseType === undefined) return value.responseCharacters === undefined && value.rawText === undefined && value.rawTextTruncated === undefined;
-	return ["object", "array", "null", "string", "number", "boolean", "undefined"].includes(String(value.responseType)) &&
+	return value.responseType === "object" &&
 		isNonnegativeNumber(value.responseCharacters) && Number.isSafeInteger(value.responseCharacters) &&
 		(value.rawText === undefined ? value.rawTextTruncated === undefined :
-			typeof value.rawText === "string" && value.rawText.length === Math.min(value.responseCharacters, JEV_RESPONSE_TEXT_LIMIT) &&
-			value.rawTextTruncated === (value.responseCharacters > JEV_RESPONSE_TEXT_LIMIT));
+			typeof value.rawText === "string" && value.rawText.length === Math.min(value.responseCharacters, CLASSIFIER_RESPONSE_TEXT_LIMIT) &&
+			value.rawTextTruncated === (value.responseCharacters > CLASSIFIER_RESPONSE_TEXT_LIMIT));
 }
 
 function isRouterResponseDiagnostics(value: unknown): value is RouterResponseDiagnostics {
@@ -170,22 +172,11 @@ function isNonnegativeNumber(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
-function isJevTiming(value: unknown): value is JevTiming {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const fields = ["setupMs", "headersMs", "bodyAndDecodeMs", "validateMs", "totalMs", "requestBytes", "httpStatus", "inputTokens", "outputTokens"];
-	return Object.entries(value).every(([key, item]) => key === "transport" ? isTransportTiming(item) : fields.includes(key) && isNonnegativeNumber(item));
-}
-
-function isTransportTiming(value: unknown): boolean {
-	if (!isRecord(value) || typeof value.status !== "string" || !["observed", "partial", "unavailable", "ambiguous"].includes(value.status) ||
-		typeof value.connection !== "string" || !["new", "reused", "unknown"].includes(value.connection) ||
-		!isNonnegativeNumber(value.requestCount) || !Number.isSafeInteger(value.requestCount)) return false;
-	const numeric = ["connectMs", "sendHeadersMs", "bodySentMs", "responseHeadersMs", "afterUploadMs"];
-	return Object.entries(value).every(([key, item]) => {
-		if (["status", "connection", "requestCount"].includes(key)) return true;
-		if (key === "socketId") return isNonnegativeNumber(item) && Number.isSafeInteger(item) && item > 0;
-		return numeric.includes(key) && isNonnegativeNumber(item);
-	});
+function readClassifierTiming(value: unknown): ClassifierTiming | undefined {
+	if (!isRecord(value)) return undefined;
+	const fields = ["classifyMs", "validateMs", "totalMs", "inputTokens", "outputTokens", "cost"];
+	const entries = Object.entries(value).filter(([key, item]) => fields.includes(key) && isNonnegativeNumber(item));
+	return entries.length ? Object.fromEntries(entries) : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

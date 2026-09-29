@@ -2,7 +2,7 @@ import { stripVTControlCharacters } from "node:util";
 import { keyHint, type CustomEntry, type Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
-import { DECISION_ENTRY_TYPE, createSelectingWidget, formatAutoEffort, formatJevTiming, readDecision, renderDecisionEntry, type EffortDecision } from "../src/selection-ui.ts";
+import { DECISION_ENTRY_TYPE, createSelectingWidget, formatAutoEffort, formatClassifierTiming, readDecision, renderDecisionEntry, type EffortDecision } from "../src/selection-ui.ts";
 import { buildStatusPages } from "../src/status-ui.ts";
 
 vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
@@ -82,29 +82,30 @@ describe("selection UI", () => {
 		expect(readDecision(saved)).toBeUndefined();
 	});
 
-	it("round trips Jev diagnostics and exposes the error code without raw text", () => {
-		const saved = entry({ jevDiagnostics: { stage: "validation", errorCode: "invalid_model", responseType: "string",
+	it("round trips Classifier diagnostics and exposes the error code without raw text", () => {
+		const saved = entry({ classifierDiagnostics: { stage: "validation", errorCode: "unsupported_effort", stopReason: "stop", responseType: "object",
 			responseCharacters: 7, rawText: "private", rawTextTruncated: false } });
 		const restored = readDecision(JSON.parse(JSON.stringify(saved)))!;
-		expect(restored.jevDiagnostics).toEqual(saved.data!.jevDiagnostics);
+		expect(restored.classifierDiagnostics).toEqual(saved.data!.classifierDiagnostics);
 		expect(diagnostics(restored)).toContain("Stage: validation");
-		expect(diagnostics(restored)).toContain("Error code: invalid_model");
-		expect(diagnostics(restored)).toContain("jevDiagnostics.rawText");
+		expect(diagnostics(restored)).toContain("Error code: unsupported_effort");
+		expect(diagnostics(restored)).toContain("classifierDiagnostics.rawText");
 		expect(diagnostics(restored)).not.toContain("private");
 		expect(render(true, restored).lines.join("\n")).not.toContain("private");
 	});
 
 	it.each([
-		null, {}, { stage: "unknown" }, { stage: "validation", errorCode: "private-error" },
-		{ stage: "response", headers: { Authorization: "private" } },
+		null, {}, { stage: "unknown" }, { stage: "request", stopReason: "unknown" }, { stage: "validation", errorCode: "private-error" },
+		{ stage: "request", headers: { Authorization: "private" } },
 		{ stage: "validation", responseType: "object" },
 		{ stage: "validation", responseType: "object", responseCharacters: -1 },
 		{ stage: "validation", responseType: "object", responseCharacters: 2, rawText: "{}" },
 		{ stage: "validation", responseType: "object", responseCharacters: 9_000, rawText: "x".repeat(9_000), rawTextTruncated: false },
-	])("rejects malformed Jev diagnostics %#", (jevDiagnostics) => {
+	])("discards malformed optional Classifier diagnostics without hiding the decision %#", (classifierDiagnostics) => {
 		const saved = entry();
-		Object.assign(saved.data!, { jevDiagnostics });
-		expect(readDecision(saved)).toBeUndefined();
+		Object.assign(saved.data!, { classifierDiagnostics });
+		expect(readDecision(saved)).toMatchObject({ status: "selected" });
+		expect(readDecision(saved)).not.toHaveProperty("classifierDiagnostics");
 	});
 
 	it("uses primary auto and the corresponding effort color", () => {
@@ -129,7 +130,7 @@ describe("selection UI", () => {
 
 	it.each([
 		["openai-codex/gpt-6-astra", "gpt-6-astra"],
-		["typesafe/jev-1.13.0", "jev-1.13.0"],
+		["typesafe/jev-latest", "jev-latest"],
 	])("shows the actual selector %s in the collapsed heading", (routerModel, label) => {
 		const { lines } = render(false, { effort: "high", routerModel });
 		expect(lines.join("\n")).toContain(`auto · high · ${label} · 1.20s`);
@@ -137,14 +138,14 @@ describe("selection UI", () => {
 	});
 
 	it.each([[0, "0.00s"], [530, "0.53s"], [12_345, "12.35s"]] as const)("shows %i milliseconds as total selection time", (elapsedMs, label) => {
-		const { lines } = render(false, { routerModel: "typesafe/jev-1.13.0", elapsedMs, jevTiming: { totalMs: 100 } });
-		expect(lines.join("\n")).toContain(`jev-1.13.0 · ${label} ctrl+o`);
+		const { lines } = render(false, { routerModel: "typesafe/jev-latest", elapsedMs, classifierTiming: { totalMs: 100 } });
+		expect(lines.join("\n")).toContain(`jev-latest · ${label} ctrl+o`);
 	});
 
-	it("labels the actual current-model selector after Jev fallback", () => {
-		const { lines } = render(false, { routerModel: "openai-codex/gpt-6-astra", reason: "Jev failed; current-model fallback", jevDiagnostics: { stage: "validation", errorCode: "missing_effort" } });
+	it("labels the actual current-model selector after Classifier fallback", () => {
+		const { lines } = render(false, { routerModel: "openai-codex/gpt-6-astra", reason: "Classifier failed; current-model fallback", classifierDiagnostics: { stage: "validation", errorCode: "missing_effort" } });
 		expect(lines.join("\n")).toContain("auto · low · gpt-6-astra · 1.20s");
-		expect(lines.join("\n")).not.toContain("jev-1.13.0");
+		expect(lines.join("\n")).not.toContain("jev-latest");
 	});
 
 	it("shows a concise decision summary when Pi expands the entry", () => {
@@ -173,23 +174,23 @@ describe("selection UI", () => {
 		expect(lines.join("\n")).toContain("Selector: not called");
 	});
 
-	it("shows Jev but reserves confidence for the diagnostics page", () => {
+	it("shows Classifier but reserves confidence for the diagnostics page", () => {
 		const { lines } = render(true, {
-			routerModel: "typesafe/jev-1.13.0", routerEffort: undefined, routerConfidence: 0.85,
-			reason: "Selected by Jev Choice",
+			routerModel: "typesafe/jev-latest", routerEffort: undefined, routerConfidence: 0.85,
+			reason: "Selected by Classifier Choice",
 		});
 		const text = lines.join("\n");
-		expect(text).toContain("Selector: typesafe/jev-1.13.0");
+		expect(text).toContain("Selector: typesafe/jev-latest");
 		expect(text).not.toContain("Confidence:");
 		expect(diagnostics({ routerConfidence: 0.85 })).toContain("Confidence: 0.850 (not success probability)");
 		expect(text).not.toContain("not called");
 		expect(text).not.toContain(" @ ");
 	});
 
-	it("preserves Jev metadata in a JSON history round trip", () => {
-		const data = entry({ routerModel: "typesafe/jev-1.13.0", routerEffort: undefined, routerConfidence: 0 });
+	it("preserves Classifier metadata in a JSON history round trip", () => {
+		const data = entry({ routerModel: "typesafe/jev-latest", routerEffort: undefined, routerConfidence: 0 });
 		expect(readDecision(JSON.parse(JSON.stringify(data)))).toMatchObject({
-			routerModel: "typesafe/jev-1.13.0", routerConfidence: 0,
+			routerModel: "typesafe/jev-latest", routerConfidence: 0,
 		});
 	});
 
@@ -198,44 +199,36 @@ describe("selection UI", () => {
 	});
 
 	it("renders partial and completed numeric timing without inventing missing stages", () => {
-		const text = diagnostics({ prepareMs: 0.5, jevTiming: { setupMs: 0.2, headersMs: 900.1 } });
+		const text = diagnostics({ prepareMs: 0.5, classifierTiming: { classifyMs: 900.1 } });
 		expect(text).toContain("Prepare: 0.5ms");
-		expect(text).toContain("headers 900.1ms");
+		expect(text).toContain("classify 900.1ms");
 		expect(text).not.toContain("body/decode");
 	});
 
-	it("round trips effort socket evidence without fabricating reused dial times", () => {
-		const data: Partial<EffortDecision> = {
-			jevTiming: { transport: { status: "observed", requestCount: 1, connection: "reused", socketId: 7, afterUploadMs: 270.3 } },
-		};
-		expect(readDecision(JSON.parse(JSON.stringify(entry(data))))).toMatchObject(data);
-		const text = diagnostics(data);
-		expect(text).toContain("Effort request\ntransport observed\nconnection reused\nsocket #7\nafter-upload 270.3ms");
-		expect(text).not.toContain("connect 0.0ms");
+	it("does not invent timing measurements", () => {
+		expect(formatClassifierTiming({})).toBe("");
+		expect(formatClassifierTiming({ totalMs: 123 })).toBe("total 123.0ms");
 	});
 
-	it.each(["partial", "unavailable", "ambiguous"] as const)("shows %s transport without inventing missing measurements", (status) => {
-		const text = formatJevTiming({ transport: { status, connection: "unknown", requestCount: status === "ambiguous" ? 2 : 0 } });
-		expect(text).toContain(`transport ${status} · connection unknown`);
-		expect(text).not.toMatch(/socket #|connect [\d.]|after-upload/);
+	it.each([null, [], { classifyMs: -1 }, { totalMs: NaN }, { classifyMs: "1" }, { requestBody: "private" }])("ignores malformed optional timing metadata: %j", (classifierTiming) => {
+		const restored = readDecision({ ...entry(), data: { ...entry().data, classifierTiming } });
+		expect(restored).toMatchObject({ status: "selected" });
+		expect(restored).not.toHaveProperty("classifierTiming");
 	});
 
-	it.each([
-		null, [], {}, { status: "private", connection: "new", requestCount: 1 },
-		{ status: "observed", connection: "private", requestCount: 1 },
-		{ status: "partial", connection: "unknown", requestCount: -1 },
-		{ status: "partial", connection: "unknown", requestCount: 0.5 },
-		{ status: "partial", connection: "unknown", requestCount: 1, socketId: 0 },
-		{ status: "partial", connection: "unknown", requestCount: 1, connectMs: NaN },
-		{ status: "partial", connection: "unknown", requestCount: 1, afterUploadMs: "100" },
-		{ status: "partial", connection: "unknown", requestCount: 1, remoteAddress: "private" },
-		{ status: "partial", connection: "unknown", requestCount: 1, headers: "private" },
-	])("rejects malformed or private transport fields: %j", (transport) => {
-		expect(readDecision({ ...entry(), data: { ...entry().data, jevTiming: { transport } } })).toBeUndefined();
-	});
-
-	it.each([null, [], { headersMs: -1 }, { totalMs: NaN }, { setupMs: "1" }, { requestBody: "private" }])("rejects malformed timing metadata: %j", (jevTiming) => {
-		expect(readDecision({ ...entry(), data: { ...entry().data, jevTiming } })).toBeUndefined();
+	it("keeps saved decisions and available usage while dropping unsupported network diagnostics", () => {
+		const saved = entry();
+		Object.assign(saved.data!, {
+			classifierTiming: { headersMs: 20, transport: { socketId: 1 }, totalMs: 30, inputTokens: 200, outputTokens: 1 },
+			classifierDiagnostics: { stage: "response", errorCode: "http_error" },
+		});
+		const restored = readDecision(JSON.parse(JSON.stringify(saved)))!;
+		expect(restored).toMatchObject({ status: "selected", effort: saved.data!.effort,
+			classifierTiming: { totalMs: 30, inputTokens: 200, outputTokens: 1 } });
+		expect(restored.classifierTiming).not.toHaveProperty("headersMs");
+		expect(restored.classifierTiming).not.toHaveProperty("transport");
+		expect(restored).not.toHaveProperty("classifierDiagnostics");
+		expect(diagnostics(restored)).toContain("200 input / 1 output");
 	});
 
 	it.each([24, 80, 120])("wraps long details within %s terminal columns", (width) => {
@@ -255,9 +248,9 @@ describe("selection UI", () => {
 
 function recentTurnDecision(): Partial<EffortDecision> {
 	return {
-		effort: "max", routerModel: "typesafe/jev-1.13.0", routerEffort: undefined, routerConfidence: 0.9,
+		effort: "max", routerModel: "typesafe/jev-latest", routerEffort: undefined, routerConfidence: 0.9,
 		prepareMs: 1, elapsedMs: 61,
-		jevTiming: { setupMs: 1, headersMs: 40, bodyAndDecodeMs: 4, validateMs: 0.5, totalMs: 45.5, inputTokens: 300, outputTokens: 1 },
+		classifierTiming: { classifyMs: 45, validateMs: 0.5, totalMs: 45.5, inputTokens: 300, outputTokens: 1 },
 		routerProbabilities: { low: 0.01, medium: 0.04, high: 0.05, max: 0.9 },
 		routing: {
 			policyVersion: "1", supportedEfforts: ["low", "medium", "high", "max"], taskTruncated: true, selectionMs: 45.5,
@@ -280,9 +273,9 @@ describe("recent-turn decision records", () => {
 		const data = recentTurnDecision();
 		const text = diagnostics(data);
 		for (const detail of [
-			"Policy: 1", "Selector choices: low, medium, high, max", "Task truncated: true",
+			"Policy: 1", "Answering model choices: low, medium, high, max", "Task truncated: true",
 			"Local context: 0.5ms", "Effort request", "total 45.5ms",
-			"Effort usage: 300 input / 1 output tokens",
+			"Classifier usage: 300 input / 1 output tokens",
 			"low: 0.01", "max: 0.9",
 		]) expect(text).toContain(detail);
 		const expanded = render(true, data, 200).lines;
@@ -314,7 +307,7 @@ describe("recent-turn decision records", () => {
 
 	it("accepts legacy records without inventing new diagnostics or usage", () => {
 		const restored = readDecision(JSON.parse(JSON.stringify(entry())))!;
-		for (const field of ["routing", "jevTiming", "routerProbabilities", "selectorUsage"]) expect(restored).not.toHaveProperty(field);
+		for (const field of ["routing", "classifierTiming", "routerProbabilities", "selectorUsage"]) expect(restored).not.toHaveProperty(field);
 		expect(render(true, restored).lines.join("\n")).not.toMatch(/Policy:|Context:|timing:|Probabilities:|usage:/);
 	});
 
@@ -354,5 +347,26 @@ describe("recent-turn decision records", () => {
 		expect(restored.selectorResponses).toEqual(selectorResponses);
 		expect(render(true, restored).lines.join("\n")).not.toContain("private");
 		expect(diagnostics(restored)).not.toContain("private");
+	});
+});
+
+describe("legacy decision isolation", () => {
+	it("ignores old classifier fields and attempt names without rewriting or crashing", () => {
+		const old = entry();
+		Object.assign(old.data!, {
+			jevTiming: { transport: { invalid: true } }, jevDiagnostics: { incompatible: true },
+			selectorAttempts: [{ backend: "jev", outcome: "selected", elapsedMs: 12, timeoutMs: 10000 }],
+			classifierTiming: { classifyMs: "unknown" }, classifierDiagnostics: { stage: "old-schema" },
+		});
+		const serialized = JSON.stringify(old);
+		const read = readDecision(old);
+		expect(read).toMatchObject({ status: "selected", effort: "low" });
+		expect(read).not.toHaveProperty("jevTiming");
+		expect(read).not.toHaveProperty("jevDiagnostics");
+		expect(read).not.toHaveProperty("classifierTiming");
+		expect(read).not.toHaveProperty("classifierDiagnostics");
+		expect(read).not.toHaveProperty("selectorAttempts");
+		expect(() => buildStatusPages({ enabled: true, model: "test/current", effort: "low", backend: "current", supportedEfforts: ["low"], last: read! })).not.toThrow();
+		expect(JSON.stringify(old)).toBe(serialized);
 	});
 });

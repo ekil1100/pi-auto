@@ -2,7 +2,7 @@ import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import { planEffort, type EffortState, type RoutingDiagnostics, type RouterInvocation } from "../src/router.ts";
 import type { HistoryMessage } from "../src/session-context.ts";
-import type { SelectJev } from "../src/jev.ts";
+import type { SelectClassifier } from "../src/classifier.ts";
 
 const signal = new AbortController().signal;
 
@@ -34,33 +34,33 @@ function input(currentModel: Model<Api> | undefined = createModel()) {
 }
 
 describe("planEffort", () => {
-	it("uses structured Jev results instead of parsing a chat response", async () => {
+	it("uses structured Classifier results instead of parsing a chat response", async () => {
 		const complete = vi.fn();
-		const selectJev = vi.fn<SelectJev>(async () => ({ effort: "low", model: "jev-1.13.0", confidence: 0.1, probabilities: { low: 1 } }));
+		const selectClassifier = vi.fn<SelectClassifier>(async () => ({ effort: "low", model: "jev-latest", confidence: 0.1, probabilities: { low: 1 } }));
 		const model = createModel();
 
-		const result = await planEffort(input(model), complete, selectJev);
+		const result = await planEffort(input(model), complete, selectClassifier);
 
 		expect(complete).not.toHaveBeenCalled();
-		expect(selectJev.mock.calls[0]?.[0].signal).toBe(signal);
+		expect(selectClassifier.mock.calls[0]?.[0].signal).toBe(signal);
 		expect(result).toEqual({ status: "selected", plan: {
-			model, effort: "low", reason: "Selected by Jev Choice", routerEffort: undefined,
+			model, effort: "low", reason: "Selected by Classifier Choice", routerEffort: undefined,
 		} });
 	});
 
 	it.each([undefined, { reasoning: false }, { thinkingLevelMap: { off: null, minimal: null, low: null, medium: null } }])("bypasses both selectors when no decision is needed: %j", async (overrides) => {
 		const complete = vi.fn();
-		const selectJev = vi.fn();
-		await planEffort({ ...input(), currentModel: overrides ? createModel(overrides) : undefined }, complete, selectJev);
+		const selectClassifier = vi.fn();
+		await planEffort({ ...input(), currentModel: overrides ? createModel(overrides) : undefined }, complete, selectClassifier);
 		expect(complete).not.toHaveBeenCalled();
-		expect(selectJev).not.toHaveBeenCalled();
+		expect(selectClassifier).not.toHaveBeenCalled();
 	});
 
 	it("still rejects unsupported efforts from a structured selector", async () => {
 		const complete = vi.fn();
 		await expect(planEffort(input(), complete, async () => ({
-			effort: "max", model: "jev-1.13.0", confidence: 1, probabilities: { max: 1 },
-		}))).rejects.toThrow("Jev returned an unsupported effort");
+			effort: "max", model: "jev-latest", confidence: 1, probabilities: { max: 1 },
+		}))).rejects.toThrow("Classifier returned an unsupported effort");
 		expect(complete).not.toHaveBeenCalled();
 	});
 
@@ -232,7 +232,7 @@ const longHistory: HistoryMessage[] = [
 function selectors() {
 	return {
 		complete: vi.fn(async (_invocation: RouterInvocation) => '{"effort":"high"}'),
-		select: vi.fn<SelectJev>(async () => ({ effort: "high", model: "jev-1.13.0", confidence: 1, probabilities: { high: 1 } })),
+		select: vi.fn<SelectClassifier>(async () => ({ effort: "high", model: "jev-latest", confidence: 1, probabilities: { high: 1 } })),
 	};
 }
 
@@ -355,5 +355,28 @@ describe.each(["model", "jev"] as const)("single-call %s routing", (backend) => 
 		const state = stateFrom(mocks);
 		expect(state.supportedEfforts).toContain("high");
 		expect(state.recentConversation).toContain("private-previous-task");
+	});
+});
+
+describe("fixed chat judge capabilities", () => {
+	it.each([
+		[{ reasoning: false }, undefined],
+		[{ thinkingLevelMap: { off: null, minimal: null, low: null, medium: null } }, "high"],
+	] as const)("uses judge effort %s but builds policy and plan for the answering model", async (overrides, expectedEffort) => {
+		const answering = createModel({ id: "answer", thinkingLevelMap: { max: "max" } });
+		const judge = createModel({ id: "judge", ...overrides });
+		const complete = vi.fn(async (_invocation: RouterInvocation) => '{"effort":"max","reason":"Hard task"}');
+		const result = await planEffort({ ...input(answering), selectorModel: judge }, complete);
+		const invocation = complete.mock.calls[0]![0];
+		expect(invocation.model).toBe(judge);
+		expect(invocation.effort).toBe(expectedEffort);
+		expect(JSON.parse(invocation.userPrompt)).toMatchObject({ model: { id: "test/answer" }, supportedEfforts: expect.arrayContaining(["max"]) });
+		expect(invocation.systemPrompt).toContain('"max"');
+		expect(result).toMatchObject({ status: "selected", plan: { model: answering, effort: "max", routerEffort: expectedEffort } });
+	});
+
+	it("rejects an effort supported only by the judge", async () => {
+		const judge = createModel({ thinkingLevelMap: { max: "max" } });
+		await expect(planEffort({ ...input(), selectorModel: judge }, async () => '{"effort":"max"}')).rejects.toThrow("unsupported_effort");
 	});
 });

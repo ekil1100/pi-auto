@@ -2,7 +2,7 @@ import { stripVTControlCharacters } from "node:util";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Keybinding, type KeybindingsManager, type TUI } from "@earendil-works/pi-tui";
-import { formatContextSummary, formatJevTiming, type EffortDecision } from "./selection-ui.ts";
+import { formatContextSummary, formatClassifierTiming, type EffortDecision } from "./selection-ui.ts";
 
 const OVERLAY_WIDTH = 96;
 const OVERLAY_MARGIN = 1;
@@ -12,6 +12,7 @@ export interface AutoStatus {
 	model: string;
 	effort: ModelThinkingLevel;
 	backend: string;
+	availability?: string;
 	supportedEfforts: readonly ModelThinkingLevel[];
 	last?: EffortDecision;
 }
@@ -28,9 +29,10 @@ export function buildStatusPages(state: AutoStatus): StatusPage[] {
 	const overview = [
 		row("Current (at open)", "accent"),
 		row(`Auto: ${state.enabled ? "enabled" : "disabled"} (effort only)`),
-		row(`Current model: ${state.model}`),
+		row(`Answering model: ${state.model}`),
 		row(`Current effort: ${state.effort}`),
-		row(`Selector backend: ${state.backend}`),
+		row(`Configured backend: ${state.backend}`),
+		row(`Availability: ${state.availability ?? "not checked"}`),
 	];
 	if (!last) overview.push(...section("Last selection"), row("No selection recorded for this branch.", "dim"));
 	else {
@@ -38,7 +40,7 @@ export function buildStatusPages(state: AutoStatus): StatusPage[] {
 			row(`Effort: ${last.previousEffort} -> ${last.effort} | ${last.status} | ${(last.elapsedMs / 1_000).toFixed(2)}s`, last.status === "selected" ? undefined : "warning"));
 		if (last.status !== "selected") overview.push(row(`Reason: ${last.reason}`, "warning"));
 		if (last.model !== state.model) overview.push(row(`Model: ${last.model}`));
-		overview.push(row(`Selector: ${last.routerModel ?? "not called"}`));
+		overview.push(row(`Actual backend: ${last.actualBackend ?? "not recorded"}`), row(`Selector: ${last.routerModel ?? "not called"}`));
 		if (context) overview.push(row(`Context: ${formatContextSummary(context)}`));
 		if (last.status === "selected") overview.push(row(`Reason: ${last.reason}`));
 		if (last.routing?.taskTruncated) overview.push(row("Current task was truncated for selection.", "warning"));
@@ -70,22 +72,23 @@ export function buildStatusPages(state: AutoStatus): StatusPage[] {
 			if (attempt.interruption) diagnostics.push(row(`Interruption source: ${attempt.interruption}`, "warning"));
 			if (attempt.reason) diagnostics.push(row(`Detail: ${attempt.reason}`));
 		}
-		if (last.jevDiagnostics || last.jevTiming) {
-			diagnostics.push(...section("Jev response"));
-			const jev = last.jevDiagnostics;
-			if (!jev) diagnostics.push(row("Jev response diagnostics not recorded.", "dim"));
+		if (last.classifierDiagnostics || last.classifierTiming) {
+			diagnostics.push(...section("Classifier response"));
+			const classifier = last.classifierDiagnostics;
+			if (!classifier) diagnostics.push(row("Classifier response diagnostics not recorded.", "dim"));
 			else {
-				diagnostics.push(row(`Stage: ${jev.stage}`));
-				if (jev.errorCode) diagnostics.push(row(`Error code: ${jev.errorCode}`, "warning"));
-				if (jev.responseType !== undefined) {
-					diagnostics.push(row(`Decoded type: ${jev.responseType}`), row(`Response text: ${jev.responseCharacters} UTF-16 units`));
-					if (jev.rawText !== undefined) diagnostics.push(row(`Response capture saved: ${jev.rawText.length} UTF-16 units | truncated: ${jev.rawTextTruncated ? "yes" : "no"}`),
-						row("Read jevDiagnostics.rawText in the session JSONL pi-auto-decision entry. Decoded JSON/text may contain sensitive data.", "warning"));
-					else diagnostics.push(row("Response body not captured. Restart with PI_AUTO_DEBUG=1 to capture future successful HTTP response bodies.", "dim"));
-				} else diagnostics.push(row("No decoded successful response recorded. HTTP error bodies are never saved.", "dim"));
+				diagnostics.push(row(`Stage: ${classifier.stage}`));
+				if (classifier.stopReason) diagnostics.push(row(`Stop reason: ${classifier.stopReason}`));
+				if (classifier.errorCode) diagnostics.push(row(`Error code: ${classifier.errorCode}`, "warning"));
+				if (classifier.responseType !== undefined) {
+					diagnostics.push(row(`Normalized type: ${classifier.responseType}`), row(`Response text: ${classifier.responseCharacters} UTF-16 units`));
+					if (classifier.rawText !== undefined) diagnostics.push(row(`Response capture saved: ${classifier.rawText.length} UTF-16 units | truncated: ${classifier.rawTextTruncated ? "yes" : "no"}`),
+						row("Read classifierDiagnostics.rawText in the session JSONL pi-auto-decision entry. Normalized answers may contain sensitive data.", "warning"));
+					else diagnostics.push(row("Normalized answers not captured. Restart with PI_AUTO_DEBUG=1 to capture future successful classifier results.", "dim"));
+				} else diagnostics.push(row("No successful classifier result recorded. Runtime errors and HTTP bodies are never saved.", "dim"));
 			}
 		}
-		diagnostics.push(...section("Current-model response"));
+		diagnostics.push(...section("Chat selector response"));
 		const response = last.selectorResponses?.effort;
 		if (response) {
 			diagnostics.push(row(`Stop reason: ${response.stopReason}`), row(`Content types: ${response.contentTypes.join(", ") || "none"}`),
@@ -93,11 +96,11 @@ export function buildStatusPages(state: AutoStatus): StatusPage[] {
 			if (response.rawText !== undefined) diagnostics.push(row(`Raw response saved: ${response.rawText.length} UTF-16 units | truncated: ${response.rawTextTruncated ? "yes" : "no"}`),
 				row("Read selectorResponses.effort.rawText in the session JSONL pi-auto-decision entry. It may contain sensitive text.", "warning"));
 			else diagnostics.push(row("Raw response not captured. Restart with PI_AUTO_DEBUG=1 to capture future responses.", "dim"));
-		} else diagnostics.push(row("No current-model response recorded (not called, no response before interruption, or older record).", "dim"));
+		} else diagnostics.push(row("No chat selector response recorded (not called, no response before interruption, or older record).", "dim"));
 		diagnostics.push(...section("Last selection policy"));
 		if (last.routerEffort) diagnostics.push(row(`Selector effort: ${last.routerEffort}`));
 		if (last.routing) diagnostics.push(row(`Policy: ${last.routing.policyVersion}`),
-			row(`Selector choices: ${last.routing.supportedEfforts.join(", ")}`), row(`Task truncated: ${last.routing.taskTruncated}`));
+			row(`Answering model choices: ${last.routing.supportedEfforts.join(", ")}`), row(`Task truncated: ${last.routing.taskTruncated}`));
 		else diagnostics.push(row("Policy metadata not recorded.", "dim"));
 		if (last.routerConfidence !== undefined || last.routerProbabilities) {
 			diagnostics.push(...section("Effort probabilities"), row("Confidence is not task success probability.", "dim"));
@@ -108,19 +111,17 @@ export function buildStatusPages(state: AutoStatus): StatusPage[] {
 		if (last.prepareMs !== undefined) diagnostics.push(row(`Prepare: ${last.prepareMs.toFixed(1)}ms`));
 		if (context?.elapsedMs !== undefined) diagnostics.push(row(`Local context: ${context.elapsedMs}ms`));
 		if (last.routing?.selectionMs !== undefined) diagnostics.push(row(`Selection: ${last.routing.selectionMs}ms`));
-		const timing = last.jevTiming;
+		const timing = last.classifierTiming;
 		if (timing) {
-			diagnostics.push(...section("Effort request"), ...formatJevTiming(timing).split(" · ").filter(Boolean).map((text) => row(text)));
-			if (timing.requestBytes !== undefined) diagnostics.push(row(`Request bytes: ${timing.requestBytes}`));
-			if (timing.httpStatus !== undefined) diagnostics.push(row(`HTTP status: ${timing.httpStatus}`));
-			if (timing.transport) diagnostics.push(row(`Observed requests: ${timing.transport.requestCount}`));
+			diagnostics.push(...section("Effort request"), ...formatClassifierTiming(timing).split(" · ").filter(Boolean).map((text) => row(text)));
 		}
 		diagnostics.push(...section("Usage"), row("Extra selector calls are not included in Pi footer totals.", "dim"));
 		let hasUsage = false;
 		if (timing?.inputTokens !== undefined || timing?.outputTokens !== undefined) {
 			hasUsage = true;
-			diagnostics.push(row(`Effort usage: ${timing.inputTokens ?? "unknown"} input / ${timing.outputTokens ?? "unknown"} output tokens`));
+			diagnostics.push(row(`Classifier usage: ${timing.inputTokens ?? "unknown"} input / ${timing.outputTokens ?? "unknown"} output tokens`));
 		}
+		if (timing?.cost !== undefined) diagnostics.push(row(`Classifier catalog cost: $${timing.cost} (zero does not imply free usage)`));
 		const usage = last.selectorUsage?.effort;
 		if (usage) {
 			hasUsage = true;
